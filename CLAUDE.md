@@ -58,7 +58,50 @@ GitHub Issue (with reaction)
 
 1. Create `prompts/{project-name}/BUILD_PLAN.md` with full specification
 2. Optionally add `EXAMPLE_TEST.txt`, `DEBUGGING_GUIDE.md`, `system_prompt.txt`
-3. Launch: `make launch PROJECT_NAME={project-name}`
+3. Rebuild and push the Docker image (prompts are baked into the image — see "Deploying Changes")
+4. Launch: `make launch PROJECT_NAME={project-name}`
+
+## Deploying Changes
+
+Changes to agent code (`claude_code.py`, `bedrock_entrypoint.py`, `src/`), prompts (`prompts/`), or the scaffold template require rebuilding and pushing the Docker image. The Dockerfile (`COPY prompts/ ./prompts/`) bakes prompts into the image at `/app/prompts/` — merging to `main` alone does NOT update the running agent.
+
+### Full deployment sequence
+
+```bash
+# 1. Deploy CDK infrastructure (if stack resources changed)
+make deploy-infra
+
+# 2. Build and push the Docker image to ECR
+#    Get the ECR URI from stack outputs:
+make show-config   # look for ECR_URI
+
+#    Login, build, push:
+aws ecr get-login-password --region us-east-1 --profile default | \
+  docker login --username AWS --password-stdin <ECR_URI>
+docker build -t <ECR_URI>:latest .
+docker push <ECR_URI>:latest
+
+# 3. (Optional) Update runtime env vars if they changed
+make update-runtime-env
+
+# 4. Reset agent state for a fresh run
+make reset
+
+# 5. Launch a new session (or let issue-poller trigger one)
+make launch
+```
+
+### What requires an image rebuild
+
+| Change | Rebuild image? | CDK deploy? |
+|--------|---------------|-------------|
+| `prompts/` (BUILD_PLAN, system_prompt) | **Yes** | No |
+| `claude_code.py`, `bedrock_entrypoint.py` | **Yes** | No |
+| `src/*.py` (git_operations, github_integration) | **Yes** | No |
+| `frontend-scaffold-template/` | **Yes** | No |
+| `infrastructure/lib/claude-code-stack.ts` | No | **Yes** |
+| `Makefile` (env var defaults) | No | No (use `make update-runtime-env`) |
+| `.github/workflows/` | No | No (picked up from `main` by GitHub Actions) |
 
 ## Resetting Agent State
 
