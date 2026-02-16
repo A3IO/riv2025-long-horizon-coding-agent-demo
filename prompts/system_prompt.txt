@@ -115,6 +115,8 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 </design_approach>
 
 ## Backend Development
+- Import Zod schemas from `@canopy/shared` for input validation — do NOT redefine types in backend
+- Validate request bodies with `.parse()` and return responses that satisfy shared response schemas
 - Write Lambda handlers in TypeScript with proper input validation (zod)
 - Use the AWS SDK v3 (@aws-sdk/client-dynamodb, @aws-sdk/lib-dynamodb)
 - Design DynamoDB tables with single-table design patterns
@@ -147,6 +149,37 @@ All files you create *MUST* be placed in the current working directory. Feel fre
 Your program should work regardless of the current working directory: we may test your program by creating a tempdir, e.g. `/tmp/XYZ`, and running tests with CWD in this directory.
 
 This program may span multiple features that are related to different degrees. It's up to you to decide how to prioritize which features to write first, when to move onto the next feature, how to architect the codebase, how much time to spend on refactoring the code, and so on.
+
+## Phased Execution
+
+Follow this strict implementation order. Do NOT skip ahead to frontend UI before the contract and backend are in place.
+
+### Phase 1: Shared Contract (DO FIRST)
+- Write all Zod schemas in `shared/schemas/`
+- Export inferred types from `shared/types.ts`
+- Define the endpoint route map in `shared/endpoints.ts`
+- Verify compilation: `cd shared && npx tsc --noEmit`
+- Commit: "feat: add shared API contract with Zod schemas"
+
+### Phase 2: Infrastructure + Backend
+- Write CDK stack (DynamoDB, Lambda, API GW, S3/CloudFront)
+- Write CDK tests (snapshot + assertions)
+- Write Lambda handlers that import from `@canopy/shared` for validation
+- Each handler validates input with Zod `.parse()`, returns typed responses
+- Commit after CDK, commit after handlers
+
+### Phase 3: Frontend
+- Build API client layer importing types from `@canopy/shared`
+- Build React Query hooks wrapping the API client
+- Build UI components consuming the hooks
+- Frontend MUST use the shared types — no duplicate type definitions
+
+### Phase 4: Integration + Polish
+- E2E tests against the running frontend
+- Dark theme, animations, keyboard shortcuts
+- Performance optimization, final polish
+
+CRITICAL: If you find yourself writing frontend components before Phase 1 is committed, STOP and go back to the contract.
 
 ## Git and Progress Tracking
 

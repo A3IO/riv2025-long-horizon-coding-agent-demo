@@ -12,12 +12,13 @@
     avoids typical AI-generated aesthetics.
 
     ARCHITECTURE: This is a full-stack serverless application structured as a monorepo:
+    - Shared: Zod schemas defining the API contract (source of truth for types)
     - Frontend: React SPA deployed to S3 + CloudFront
     - Backend: Lambda handlers behind API Gateway (HTTP API)
     - Database: DynamoDB with single-table design
     - Infrastructure: AWS CDK stack defining all resources
-    The frontend uses VITE_API_URL env var to reach the API. It should fall back to local
-    mode (IndexedDB via Dexie) if the API is unavailable, for local development.
+    The frontend uses VITE_API_URL env var to reach the API. Both frontend and backend
+    import types from the shared/ package — contract mismatch is impossible at compile time.
   </overview>
 
   <technology_stack>
@@ -26,15 +27,15 @@
       <build_tool>Vite 6 for fast dev server and optimized static builds</build_tool>
       <styling>Tailwind CSS v4 for utility-first styling (using @tailwindcss/vite plugin)</styling>
       <routing>React Router v7 for client-side navigation</routing>
-      <state_management>React Context + useReducer for complex state, Dexie for persistent state</state_management>
+      <state_management>React Context + useReducer for complex state, React Query for server state</state_management>
     </frontend_application>
     <data_layer>
       <database>Amazon DynamoDB for structured data persistence (single-table design)</database>
       <api>AWS Lambda + API Gateway (HTTP API) for RESTful backend</api>
       <api_client>fetch-based API client with React Query for caching and optimistic updates</api_client>
       <search>Server-side DynamoDB query + GSI for filtering; client-side MiniSearch for instant search UX</search>
-      <fallback>Dexie.js v4 wrapping IndexedDB as fallback when API is unavailable (local dev mode)</fallback>
-      <note>Frontend uses VITE_API_URL env var to reach the API. Falls back to local mode (IndexedDB) if API is unavailable.</note>
+      <shared_contract>Zod schemas in shared/ package — single source of truth for request/response types</shared_contract>
+      <note>Frontend uses VITE_API_URL env var to reach the API. Both frontend and backend import types from shared/.</note>
     </data_layer>
     <build_output>
       <frontend_build>npm run build in frontend/ produces dist/ folder</frontend_build>
@@ -98,42 +99,343 @@
     </dynamodb_design>
   </infrastructure>
 
-  <api_specification>
+  <api_contract>
+    The API contract lives in the shared/ package and is the SINGLE SOURCE OF TRUTH for
+    request/response types. Both frontend and backend import from shared/ — this makes
+    contract mismatch impossible at compile time.
+
     Base URL: Provided via VITE_API_URL environment variable at build time.
-
-    Endpoints:
-    POST   /projects              Create project
-    GET    /projects              List projects
-    GET    /projects/{id}         Get project
-    PUT    /projects/{id}         Update project
-    DELETE /projects/{id}         Delete project
-
-    POST   /projects/{id}/issues  Create issue
-    GET    /projects/{id}/issues  List issues (with query params for filtering)
-    GET    /issues/{id}           Get issue
-    PUT    /issues/{id}           Update issue
-    DELETE /issues/{id}           Delete issue
-    POST   /issues/{id}/comments  Add comment
-    PUT    /issues/bulk           Bulk update issues
-
-    POST   /projects/{id}/sprints Create sprint
-    GET    /projects/{id}/sprints List sprints
-    PUT    /sprints/{id}          Update sprint (start/complete)
-
-    GET    /projects/{id}/board   Get board configuration
-    PUT    /boards/{id}           Update board
-
-    GET    /search?q={query}&amp;project={id}  Full-text search
-
     All endpoints return JSON. Errors use standard HTTP status codes.
     CORS: Allow origin from CloudFront domain.
-  </api_specification>
+
+    <shared_directory_structure>
+      ```
+      shared/
+      ├── package.json              # { "name": "@canopy/shared", "main": "src/index.ts" }
+      ├── tsconfig.json
+      └── src/
+          ├── schemas/
+          │   ├── common.ts         # Shared enums, pagination, error responses
+          │   ├── project.ts        # Project CRUD schemas
+          │   ├── issue.ts          # Issue CRUD schemas
+          │   ├── sprint.ts         # Sprint CRUD schemas
+          │   ├── board.ts          # Board schemas
+          │   ├── comment.ts        # Comment schemas
+          │   ├── search.ts         # Search schemas
+          │   └── index.ts          # Re-exports all schemas
+          ├── types.ts              # z.infer<> types — NEVER manually written
+          ├── endpoints.ts          # Route map: method, path, request/response schemas
+          └── index.ts              # Re-exports everything
+      ```
+    </shared_directory_structure>
+
+    <schema_definitions>
+      Write these EXACT schemas in shared/src/schemas/. The agent must produce these files
+      as the first coding step (Phase 1).
+
+      ```typescript
+      // shared/src/schemas/common.ts
+      import { z } from 'zod';
+
+      export const IssueType = z.enum(['Epic', 'Story', 'Bug', 'Task', 'Sub-task']);
+      export const Priority = z.enum(['Highest', 'High', 'Medium', 'Low', 'Lowest']);
+      export const SprintStatus = z.enum(['future', 'active', 'completed']);
+      export const StatusCategory = z.enum(['todo', 'in_progress', 'done']);
+      export const UserRole = z.enum(['admin', 'member', 'viewer']);
+
+      export const PaginationSchema = z.object({
+        page: z.number().int().min(1).default(1),
+        limit: z.number().int().min(1).max(100).default(50),
+        sortBy: z.string().optional(),
+        sortOrder: z.enum(['asc', 'desc']).default('desc'),
+      });
+
+      export const PaginatedResponseSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
+        z.object({
+          items: z.array(itemSchema),
+          total: z.number(),
+          page: z.number(),
+          limit: z.number(),
+          hasMore: z.boolean(),
+        });
+
+      export const ErrorResponseSchema = z.object({
+        error: z.object({
+          code: z.string(),
+          message: z.string(),
+          details: z.record(z.unknown()).optional(),
+        }),
+      });
+
+      export const TimestampFields = z.object({
+        createdAt: z.string().datetime(),
+        updatedAt: z.string().datetime(),
+      });
+      ```
+
+      ```typescript
+      // shared/src/schemas/project.ts
+      import { z } from 'zod';
+      import { TimestampFields } from './common';
+
+      export const CreateProjectSchema = z.object({
+        name: z.string().min(1).max(100),
+        key: z.string().min(2).max(10).regex(/^[A-Z]+$/, 'Must be uppercase letters'),
+        description: z.string().optional(),
+        leadUserId: z.string().uuid().optional(),
+        defaultAssigneeId: z.string().uuid().optional(),
+        color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+        icon: z.string().optional(),
+      });
+
+      export const UpdateProjectSchema = CreateProjectSchema.partial();
+
+      export const ProjectSchema = CreateProjectSchema.extend({
+        id: z.string().uuid(),
+        issueCounter: z.number().int().default(0),
+        isArchived: z.boolean().default(false),
+        settings: z.record(z.unknown()).default({}),
+      }).merge(TimestampFields);
+      ```
+
+      ```typescript
+      // shared/src/schemas/issue.ts
+      import { z } from 'zod';
+      import { IssueType, Priority, TimestampFields } from './common';
+
+      export const CreateIssueSchema = z.object({
+        projectId: z.string().uuid(),
+        type: IssueType,
+        summary: z.string().min(1).max(255),
+        description: z.string().optional(),
+        priority: Priority.default('Medium'),
+        assigneeId: z.string().uuid().optional(),
+        epicId: z.string().uuid().optional(),
+        parentId: z.string().uuid().optional(),
+        sprintId: z.string().uuid().optional(),
+        storyPoints: z.number().min(0.5).max(100).optional(),
+        labels: z.array(z.string()).default([]),
+        components: z.array(z.string()).default([]),
+        dueDate: z.string().datetime().optional(),
+        timeEstimate: z.number().int().min(0).optional(),
+      });
+
+      export const UpdateIssueSchema = CreateIssueSchema.partial().extend({
+        status: z.string().optional(),
+        sortOrder: z.number().optional(),
+        resolvedAt: z.string().datetime().optional(),
+        timeSpent: z.number().int().min(0).optional(),
+      });
+
+      export const IssueSchema = CreateIssueSchema.extend({
+        id: z.string().uuid(),
+        key: z.string(), // e.g. "CAN-123"
+        status: z.string().default('todo'),
+        reporterId: z.string().uuid(),
+        sortOrder: z.number().default(0),
+        resolvedAt: z.string().datetime().optional(),
+        timeSpent: z.number().int().default(0),
+      }).merge(TimestampFields);
+
+      export const BulkUpdateIssuesSchema = z.object({
+        issueIds: z.array(z.string().uuid()).min(1),
+        update: UpdateIssueSchema,
+      });
+      ```
+
+      ```typescript
+      // shared/src/schemas/sprint.ts
+      import { z } from 'zod';
+      import { SprintStatus, TimestampFields } from './common';
+
+      export const CreateSprintSchema = z.object({
+        projectId: z.string().uuid(),
+        name: z.string().min(1).max(100),
+        goal: z.string().optional(),
+        startDate: z.string().datetime().optional(),
+        endDate: z.string().datetime().optional(),
+      });
+
+      export const UpdateSprintSchema = CreateSprintSchema.partial().extend({
+        status: SprintStatus.optional(),
+      });
+
+      export const SprintSchema = CreateSprintSchema.extend({
+        id: z.string().uuid(),
+        status: SprintStatus.default('future'),
+        completedAt: z.string().datetime().optional(),
+        velocity: z.number().default(0),
+      }).merge(TimestampFields);
+      ```
+
+      ```typescript
+      // shared/src/schemas/board.ts
+      import { z } from 'zod';
+      import { StatusCategory, TimestampFields } from './common';
+
+      export const BoardColumnSchema = z.object({
+        id: z.string().uuid(),
+        name: z.string().min(1),
+        statusCategory: StatusCategory,
+        sortOrder: z.number(),
+        wipLimit: z.number().int().min(0).optional(),
+        color: z.string().optional(),
+      });
+
+      export const BoardSchema = z.object({
+        id: z.string().uuid(),
+        projectId: z.string().uuid(),
+        name: z.string().default('Board'),
+        columns: z.array(BoardColumnSchema),
+        filterQuery: z.string().optional(),
+        swimlaneBy: z.enum(['none', 'assignee', 'epic', 'priority']).default('none'),
+      }).merge(TimestampFields);
+
+      export const UpdateBoardSchema = z.object({
+        name: z.string().optional(),
+        columns: z.array(BoardColumnSchema).optional(),
+        filterQuery: z.string().optional(),
+        swimlaneBy: z.enum(['none', 'assignee', 'epic', 'priority']).optional(),
+      });
+      ```
+
+      ```typescript
+      // shared/src/schemas/comment.ts
+      import { z } from 'zod';
+      import { TimestampFields } from './common';
+
+      export const CreateCommentSchema = z.object({
+        issueId: z.string().uuid(),
+        body: z.string().min(1),
+      });
+
+      export const CommentSchema = CreateCommentSchema.extend({
+        id: z.string().uuid(),
+        authorId: z.string().uuid(),
+        isEdited: z.boolean().default(false),
+      }).merge(TimestampFields);
+      ```
+
+      ```typescript
+      // shared/src/schemas/search.ts
+      import { z } from 'zod';
+      import { IssueSchema } from './issue';
+      import { ProjectSchema } from './project';
+
+      export const SearchQuerySchema = z.object({
+        q: z.string().min(1),
+        projectId: z.string().uuid().optional(),
+        type: z.enum(['issues', 'projects', 'all']).default('all'),
+        limit: z.number().int().min(1).max(50).default(20),
+      });
+
+      export const SearchResultSchema = z.object({
+        issues: z.array(IssueSchema).default([]),
+        projects: z.array(ProjectSchema).default([]),
+        total: z.number(),
+      });
+      ```
+    </schema_definitions>
+
+    <types_file>
+      ```typescript
+      // shared/src/types.ts — ALL types derived from Zod schemas, NEVER manually defined
+      import { z } from 'zod';
+      import * as schemas from './schemas';
+
+      // Common
+      export type IssueType = z.infer<typeof schemas.IssueType>;
+      export type Priority = z.infer<typeof schemas.Priority>;
+      export type SprintStatus = z.infer<typeof schemas.SprintStatus>;
+      export type StatusCategory = z.infer<typeof schemas.StatusCategory>;
+      export type Pagination = z.infer<typeof schemas.PaginationSchema>;
+      export type ErrorResponse = z.infer<typeof schemas.ErrorResponseSchema>;
+
+      // Project
+      export type CreateProject = z.infer<typeof schemas.CreateProjectSchema>;
+      export type UpdateProject = z.infer<typeof schemas.UpdateProjectSchema>;
+      export type Project = z.infer<typeof schemas.ProjectSchema>;
+
+      // Issue
+      export type CreateIssue = z.infer<typeof schemas.CreateIssueSchema>;
+      export type UpdateIssue = z.infer<typeof schemas.UpdateIssueSchema>;
+      export type Issue = z.infer<typeof schemas.IssueSchema>;
+      export type BulkUpdateIssues = z.infer<typeof schemas.BulkUpdateIssuesSchema>;
+
+      // Sprint
+      export type CreateSprint = z.infer<typeof schemas.CreateSprintSchema>;
+      export type UpdateSprint = z.infer<typeof schemas.UpdateSprintSchema>;
+      export type Sprint = z.infer<typeof schemas.SprintSchema>;
+
+      // Board
+      export type BoardColumn = z.infer<typeof schemas.BoardColumnSchema>;
+      export type Board = z.infer<typeof schemas.BoardSchema>;
+      export type UpdateBoard = z.infer<typeof schemas.UpdateBoardSchema>;
+
+      // Comment
+      export type CreateComment = z.infer<typeof schemas.CreateCommentSchema>;
+      export type Comment = z.infer<typeof schemas.CommentSchema>;
+
+      // Search
+      export type SearchQuery = z.infer<typeof schemas.SearchQuerySchema>;
+      export type SearchResult = z.infer<typeof schemas.SearchResultSchema>;
+      ```
+    </types_file>
+
+    <endpoint_route_map>
+      ```typescript
+      // shared/src/endpoints.ts — ties routes to request/response schemas
+      import { z } from 'zod';
+      import {
+        CreateProjectSchema, UpdateProjectSchema, ProjectSchema,
+        CreateIssueSchema, UpdateIssueSchema, IssueSchema, BulkUpdateIssuesSchema,
+        CreateSprintSchema, UpdateSprintSchema, SprintSchema,
+        BoardSchema, UpdateBoardSchema,
+        CreateCommentSchema, CommentSchema,
+        SearchQuerySchema, SearchResultSchema,
+        PaginationSchema,
+      } from './schemas';
+
+      export const endpoints = {
+        // Projects
+        createProject:  { method: 'POST',   path: '/projects',              body: CreateProjectSchema,  response: ProjectSchema },
+        listProjects:   { method: 'GET',    path: '/projects',              query: PaginationSchema,    response: z.array(ProjectSchema) },
+        getProject:     { method: 'GET',    path: '/projects/:id',          response: ProjectSchema },
+        updateProject:  { method: 'PUT',    path: '/projects/:id',          body: UpdateProjectSchema,  response: ProjectSchema },
+        deleteProject:  { method: 'DELETE', path: '/projects/:id',          response: z.object({ success: z.boolean() }) },
+
+        // Issues
+        createIssue:    { method: 'POST',   path: '/projects/:id/issues',   body: CreateIssueSchema,    response: IssueSchema },
+        listIssues:     { method: 'GET',    path: '/projects/:id/issues',   query: PaginationSchema,    response: z.array(IssueSchema) },
+        getIssue:       { method: 'GET',    path: '/issues/:id',            response: IssueSchema },
+        updateIssue:    { method: 'PUT',    path: '/issues/:id',            body: UpdateIssueSchema,    response: IssueSchema },
+        deleteIssue:    { method: 'DELETE', path: '/issues/:id',            response: z.object({ success: z.boolean() }) },
+        bulkUpdate:     { method: 'PUT',    path: '/issues/bulk',           body: BulkUpdateIssuesSchema, response: z.array(IssueSchema) },
+
+        // Comments
+        addComment:     { method: 'POST',   path: '/issues/:id/comments',   body: CreateCommentSchema,  response: CommentSchema },
+
+        // Sprints
+        createSprint:   { method: 'POST',   path: '/projects/:id/sprints',  body: CreateSprintSchema,   response: SprintSchema },
+        listSprints:    { method: 'GET',    path: '/projects/:id/sprints',  response: z.array(SprintSchema) },
+        updateSprint:   { method: 'PUT',    path: '/sprints/:id',           body: UpdateSprintSchema,   response: SprintSchema },
+
+        // Boards
+        getBoard:       { method: 'GET',    path: '/projects/:id/board',    response: BoardSchema },
+        updateBoard:    { method: 'PUT',    path: '/boards/:id',            body: UpdateBoardSchema,    response: BoardSchema },
+
+        // Search
+        search:         { method: 'GET',    path: '/search',                query: SearchQuerySchema,   response: SearchResultSchema },
+      } as const;
+      ```
+    </endpoint_route_map>
+  </api_contract>
 
   <prerequisites>
     <environment_setup>
       - Node.js 20+ installed for development
       - pnpm or npm for package management
-      - Modern browser with IndexedDB support (Chrome, Firefox, Safari, Edge)
+      - Modern browser (Chrome, Firefox, Safari, Edge)
     </environment_setup>
     <build_configuration>
       - Vite configured for static build output
@@ -145,7 +447,12 @@
   </prerequisites>
 
   <core_data_entities>
+    NOTE: The canonical type definitions for these entities are the Zod schemas in
+    shared/src/schemas/. The descriptions below provide human-readable context.
+    When writing code, ALWAYS import types from @canopy/shared — never redefine them.
+
     <projects>
+      See shared/src/schemas/project.ts for Zod schemas (CreateProjectSchema, UpdateProjectSchema, ProjectSchema).
       - id: string (uuid)
       - key: string (unique project key like "CAN", "PROJ", max 10 chars uppercase)
       - name: string (required, max 100 characters)
@@ -162,14 +469,15 @@
     </projects>
 
     <issues>
+      See shared/src/schemas/issue.ts for Zod schemas (CreateIssueSchema, UpdateIssueSchema, IssueSchema, BulkUpdateIssuesSchema).
       - id: string (uuid)
       - projectId: string (required, references project)
       - key: string (generated, e.g., "CAN-123")
-      - type: enum (Story, Bug, Task, Epic, Sub-task)
+      - type: enum (Story, Bug, Task, Epic, Sub-task) — see IssueType in common.ts
       - status: string (references board column, e.g., "todo", "in-progress", "done")
       - summary: string (required, max 255 characters, the issue title)
       - description: string (optional, markdown supported, rich text)
-      - priority: enum (Highest, High, Medium, Low, Lowest)
+      - priority: enum (Highest, High, Medium, Low, Lowest) — see Priority in common.ts
       - reporterId: string (who created the issue)
       - assigneeId: string (optional, who is working on it)
       - epicId: string (optional, parent epic for Stories/Tasks/Bugs)
@@ -188,26 +496,28 @@
     </issues>
 
     <sprints>
+      See shared/src/schemas/sprint.ts for Zod schemas (CreateSprintSchema, UpdateSprintSchema, SprintSchema).
       - id: string (uuid)
       - projectId: string (required)
       - name: string (required, e.g., "Sprint 1", "Sprint 23")
       - goal: string (optional, sprint objective)
       - startDate: Date (optional, when sprint starts)
       - endDate: Date (optional, when sprint ends)
-      - status: enum (future, active, completed)
+      - status: enum (future, active, completed) — see SprintStatus in common.ts
       - createdAt: Date
       - completedAt: Date (optional)
       - velocity: number (calculated story points completed)
     </sprints>
 
     <boards>
+      See shared/src/schemas/board.ts for Zod schemas (BoardSchema, BoardColumnSchema, UpdateBoardSchema).
       - id: string (uuid)
       - projectId: string (required)
       - name: string (default "Board", can have multiple boards per project)
       - columns: array of column objects:
         * id: string
         * name: string (e.g., "To Do", "In Progress", "Done")
-        * statusCategory: enum (todo, in_progress, done)
+        * statusCategory: enum (todo, in_progress, done) — see StatusCategory in common.ts
         * sortOrder: number
         * wipLimit: number (optional, work-in-progress limit)
         * color: string (optional, column header color)
@@ -243,6 +553,7 @@
     </components>
 
     <comments>
+      See shared/src/schemas/comment.ts for Zod schemas (CreateCommentSchema, CommentSchema).
       - id: string (uuid)
       - issueId: string (required)
       - authorId: string (required)
@@ -886,7 +1197,7 @@
       - Quick filter: text search in current view
       - JQL-like query language
       - Save filters for reuse
-      - Share filters (store in IndexedDB, exportable)
+      - Share filters (exportable)
       - Recent searches history
       - Full-text search using MiniSearch
       - Search across: summary, description, comments
@@ -894,14 +1205,11 @@
     </filtering_and_search>
 
     <data_persistence>
-      - All data stored in IndexedDB via Dexie
-      - Automatic saving (no save button)
-      - Reactive queries: UI auto-updates on data change
-      - Cross-tab sync: changes reflect in other tabs
-      - Export: JSON backup of all data
-      - Import: restore from JSON backup
-      - Data schema versioning for migrations
-      - Graceful handling of quota limits
+      - All data stored in DynamoDB via Lambda API
+      - React Query for caching, optimistic updates, and background refetching
+      - Automatic saving (no save button) — mutations fire API calls
+      - Export: JSON backup of all data via API
+      - Import: restore from JSON backup via API
     </data_persistence>
 
     <time_tracking>
@@ -1230,13 +1538,6 @@
       - No external push notifications (local only)
     </notifications>
 
-    <offline_support>
-      - All data in IndexedDB (works offline)
-      - No server dependency
-      - Full functionality offline
-      - Export/import for backup
-    </offline_support>
-
     <multi_user_simulation>
       - Create multiple users locally
       - Switch between users (simulates team)
@@ -1500,8 +1801,7 @@
       - Sprint management: create, start, complete with proper state transitions
       - Search returns relevant results quickly (under 100ms)
       - Filters execute correctly with JQL-like syntax
-      - Data persists correctly in IndexedDB
-      - Cross-tab sync works (changes reflect in other tabs)
+      - Data persists correctly in DynamoDB via API
       - Export/import produces valid data and restores correctly
       - Keyboard shortcuts work throughout application
       - No data loss under normal operation
@@ -1521,7 +1821,7 @@
 
     <technical_quality>
       - Clean, modular React component architecture
-      - Efficient Dexie queries with proper indexes
+      - Efficient DynamoDB queries with proper GSI design
       - No memory leaks during extended use
       - Build output under 500KB gzipped (excluding charts)
       - Proper TypeScript types (if using TypeScript)
@@ -1545,7 +1845,6 @@
       - `npm run build` produces clean static output in dist/
       - Output works when served from any static host
       - No CORS issues or external dependencies at runtime
-      - Works offline after initial load (IndexedDB persists data)
       - Handles browser back/forward navigation correctly
       - SPA routing compatible (single index.html entry point)
     </build>
@@ -1564,129 +1863,156 @@
 
   <key_implementation_notes>
     <critical_paths>
-      - Monorepo structure and CDK stack are foundation - set up first
-      - DynamoDB single-table design and GSIs - get right before writing handlers
-      - Lambda handlers with proper error handling and validation
-      - API client layer with React Query for caching
-      - Drag and drop on board is core UX - must be smooth
-      - Issue detail panel performance - many re-renders possible
-      - Filter query parser - complex but important for power users
-      - Sprint state transitions - need clear rules
-      - Fallback to IndexedDB when API unavailable (local dev)
+      - Shared contract in shared/ is the foundation — write FIRST, never drift
+      - Monorepo workspace setup so shared/ resolves correctly
+      - DynamoDB single-table design and GSIs — get right before writing handlers
+      - Lambda handlers import from @canopy/shared for validation — no duplicate types
+      - Frontend API client typed against shared/endpoints.ts — no freestyle types
+      - Drag and drop on board is core UX — must be smooth
+      - Sprint state transitions — need clear rules
     </critical_paths>
 
     <recommended_implementation_order>
-      1. Project setup: monorepo with frontend/, backend/, infrastructure/
-      2. CDK stack: DynamoDB table, Lambda, API Gateway (deploy first so URLs are available)
-      3. CDK tests: snapshot + assertion tests
-      4. Backend Lambda handlers: CRUD for projects, issues, sprints
-      5. API client layer in frontend (fetch + React Query)
-      6. Basic routing structure (React Router)
-      7. Global layout: header, sidebar, main content area
-      8. Project CRUD and project selector
-      9. Issue CRUD with basic fields
-      10. Board view with columns and drag-and-drop
-      11. Issue detail panel
-      12. Backlog view with drag-and-drop
-      13. Sprint management (create, start, complete)
-      14. Sprint planning (drag to sprint)
-      15. Labels and components management
-      16. Epic management and issue linking
-      17. Search and filtering (MiniSearch integration)
-      18. JQL-like filter parser
-      19. Reports: burndown chart, velocity chart
-      20. Dashboard home page
-      21. User preferences and theme switching
-      22. Export/import functionality
-      23. Keyboard shortcuts throughout
-      24. Animations and polish
-      25. Dark theme completion
-      26. Performance optimization
-      27. E2E tests against deployed API
-      28. Final testing and bug fixes
+      CRITICAL: Follow these phases IN ORDER. Do NOT skip to frontend UI before Phase 1 and 2 are done.
+
+      Phase 0: Monorepo Setup
+      1. Root package.json with workspaces: ["shared", "backend", "frontend", "infrastructure", "e2e"]
+      2. tsconfig.base.json with strict settings
+      3. Scaffold all workspace directories with their package.json files
+      4. Verify `npm install` resolves workspace references
+
+      Phase 1: Shared Contract (DO FIRST — no other code before this)
+      5. Write all Zod schemas in shared/src/schemas/ (common, project, issue, sprint, board, comment, search)
+      6. Write shared/src/schemas/index.ts re-exporting everything
+      7. Write shared/src/types.ts with z.infer<> types
+      8. Write shared/src/endpoints.ts with the route map
+      9. Write shared/src/index.ts re-exporting schemas, types, and endpoints
+      10. Verify: `cd shared && npx tsc --noEmit` passes
+      11. Commit: "feat: add shared API contract with Zod schemas"
+
+      Phase 2a: Infrastructure (can overlap with 2b)
+      12. CDK stack: DynamoDB table (single-table design with GSIs), Lambda, API Gateway HTTP API, S3 bucket, CloudFront
+      13. CDK tests: snapshot + fine-grained assertion tests
+      14. Verify: `cd infrastructure && npm test && npx cdk synth`
+      15. Commit: "feat: add CDK infrastructure stack"
+
+      Phase 2b: Backend
+      16. Lambda handler router (index.ts) dispatching to handler modules
+      17. DynamoDB client helpers (db.ts)
+      18. Project handlers: import CreateProjectSchema from @canopy/shared, validate with .parse()
+      19. Issue handlers: CRUD + bulk update, all validated via shared schemas
+      20. Sprint handlers: create, start, complete with state machine
+      21. Board, comment, search handlers
+      22. Verify: all handlers compile, unit tests pass
+      23. Commit: "feat: add Lambda handlers with shared schema validation"
+
+      Phase 3: Frontend
+      24. API client layer: typed fetch wrapper using endpoints from @canopy/shared
+      25. React Query hooks wrapping the API client (useProjects, useIssues, useSprints, etc.)
+      26. Basic routing structure (React Router)
+      27. Global layout: header, sidebar, main content area
+      28. Project CRUD and project selector
+      29. Issue CRUD with basic fields
+      30. Board view with columns and drag-and-drop
+      31. Issue detail panel
+      32. Backlog view with drag-and-drop
+      33. Sprint management (create, start, complete)
+      34. Sprint planning (drag to sprint)
+      35. Labels and components management
+      36. Epic management and issue linking
+      37. Search and filtering (MiniSearch integration)
+      38. JQL-like filter parser
+      39. Reports: burndown chart, velocity chart
+      40. Dashboard home page
+      41. Commit after each major feature group
+
+      Phase 4: Integration + Polish
+      42. User preferences and theme switching
+      43. Export/import functionality
+      44. Keyboard shortcuts throughout
+      45. Animations and polish
+      46. Dark theme completion
+      47. Performance optimization
+      48. E2E tests against running frontend + API
+      49. Final testing and bug fixes
     </recommended_implementation_order>
 
-    <dexie_schema>
-      NOTE: This Dexie schema is used as a FALLBACK for local development when the API is unavailable.
-      The primary data store is DynamoDB (see infrastructure/dynamodb_design section above).
-      The frontend should detect if VITE_API_URL is set and use the API client; otherwise fall back to Dexie.
-
-      ```javascript
-      import Dexie from 'dexie';
-
-      const db = new Dexie('CanopyDB');
-
-      db.version(1).stores({
-        projects: 'id, key, name, isArchived, createdAt',
-        issues: 'id, projectId, key, type, status, priority, assigneeId, epicId, parentId, sprintId, createdAt, [projectId+status], [projectId+sprintId], [projectId+epicId]',
-        sprints: 'id, projectId, status, startDate, endDate',
-        boards: 'id, projectId',
-        users: 'id, email, name',
-        labels: 'id, projectId, name',
-        components: 'id, projectId, name',
-        comments: 'id, issueId, authorId, createdAt',
-        activityLog: 'id, issueId, timestamp',
-        filters: 'id, ownerId, projectId',
-        customFields: 'id, projectId',
-        settings: 'key' // For global settings like theme
-      });
-
-      export default db;
-      ```
-    </dexie_schema>
-
     <monorepo_structure>
-      The generated-app/ directory MUST be structured as a monorepo:
+      The generated-app/ directory MUST be structured as a monorepo with npm workspaces.
+      The shared/ package is written FIRST (Phase 1) and both frontend/ and backend/ depend on it.
 
       ```
       generated-app/
-      ├── frontend/                    # React/Vite app
-      │   ├── src/
-      │   │   ├── api/                # API client layer
-      │   │   │   ├── client.ts       # fetch wrapper using VITE_API_URL
-      │   │   │   ├── projects.ts     # project CRUD API calls
-      │   │   │   ├── issues.ts       # issue CRUD API calls
-      │   │   │   └── sprints.ts      # sprint CRUD API calls
-      │   │   ├── hooks/              # React Query hooks wrapping API calls
-      │   │   ├── components/         # UI components
-      │   │   └── ...
+      ├── package.json                # Workspace root: { "workspaces": ["shared", "backend", "frontend", "infrastructure", "e2e"] }
+      ├── tsconfig.base.json          # Shared TS config (strict, ES2022)
+      ├── shared/                     # Phase 1: API contract (write FIRST)
+      │   ├── package.json            # { "name": "@canopy/shared", dependencies: { "zod": "..." } }
+      │   ├── tsconfig.json           # extends ../tsconfig.base.json
+      │   └── src/
+      │       ├── schemas/
+      │       │   ├── common.ts       # Enums, pagination, error schemas
+      │       │   ├── project.ts      # Project CRUD schemas
+      │       │   ├── issue.ts        # Issue CRUD schemas
+      │       │   ├── sprint.ts       # Sprint CRUD schemas
+      │       │   ├── board.ts        # Board schemas
+      │       │   ├── comment.ts      # Comment schemas
+      │       │   ├── search.ts       # Search schemas
+      │       │   └── index.ts        # Re-exports all schemas
+      │       ├── types.ts            # z.infer<> types — NEVER manually written
+      │       ├── endpoints.ts        # Route map with typed request/response
+      │       └── index.ts            # Re-exports everything
+      ├── backend/                    # Phase 2b: Lambda handlers
+      │   ├── package.json            # dependencies: { "@canopy/shared": "workspace:*" }
+      │   ├── tsconfig.json
+      │   └── src/
+      │       ├── handlers/
+      │       │   ├── projects.ts     # Imports schemas from @canopy/shared for validation
+      │       │   ├── issues.ts
+      │       │   ├── sprints.ts
+      │       │   ├── boards.ts
+      │       │   ├── comments.ts
+      │       │   └── search.ts
+      │       ├── lib/
+      │       │   └── db.ts           # DynamoDB client + table helpers
+      │       └── index.ts            # Lambda entry point (router)
+      ├── frontend/                   # Phase 3: React/Vite app
+      │   ├── package.json            # dependencies: { "@canopy/shared": "workspace:*" }
+      │   ├── tsconfig.json
+      │   ├── vite.config.ts
+      │   └── src/
+      │       ├── api/
+      │       │   └── client.ts       # Typed fetch wrapper using endpoints from @canopy/shared
+      │       ├── hooks/              # React Query hooks wrapping API client
+      │       ├── components/         # UI components consuming typed hooks
+      │       └── ...
+      ├── infrastructure/             # Phase 2a: CDK stack
       │   ├── package.json
-      │   └── vite.config.ts
-      ├── backend/                    # Lambda handlers (TypeScript)
-      │   ├── src/
-      │   │   ├── handlers/
-      │   │   │   ├── projects.ts     # CRUD for projects
-      │   │   │   ├── issues.ts       # CRUD for issues
-      │   │   │   ├── sprints.ts      # CRUD for sprints
-      │   │   │   ├── boards.ts       # Board management
-      │   │   │   ├── comments.ts     # Comments CRUD
-      │   │   │   └── search.ts       # Full-text search
-      │   │   ├── lib/
-      │   │   │   ├── db.ts           # DynamoDB client + table helpers
-      │   │   │   ├── types.ts        # Shared TypeScript types
-      │   │   │   └── validation.ts   # Input validation (zod)
-      │   │   └── index.ts            # Lambda entry point
-      │   ├── package.json
-      │   └── tsconfig.json
-      ├── infrastructure/             # CDK stack (agent-written)
+      │   ├── tsconfig.json
+      │   ├── cdk.json
+      │   ├── jest.config.js
       │   ├── lib/
       │   │   └── canopy-stack.ts     # API GW + Lambda + DynamoDB + S3/CF
       │   ├── test/
       │   │   └── canopy-stack.test.ts
-      │   ├── bin/
-      │   │   └── canopy.ts           # CDK app entry point
-      │   ├── cdk.json
-      │   ├── jest.config.js
-      │   ├── tsconfig.json
-      │   └── package.json
-      ├── e2e/                        # End-to-end tests
+      │   └── bin/
+      │       └── canopy.ts           # CDK app entry point
+      ├── e2e/                        # Phase 4: End-to-end tests
       │   ├── tests/
-      │   │   ├── api.spec.ts         # API endpoint tests
-      │   │   └── app.spec.ts         # Full UI + API E2E tests
+      │   │   ├── api.spec.ts
+      │   │   └── app.spec.ts
       │   └── playwright.config.ts
-      ├── package.json                # Workspace root (npm workspaces)
       ├── claude-progress.txt
       └── tests.json
+      ```
+
+      IMPORTANT: The root package.json must define workspaces so that `@canopy/shared` resolves
+      correctly when imported by frontend/ and backend/. Example:
+      ```json
+      {
+        "name": "canopy",
+        "private": true,
+        "workspaces": ["shared", "backend", "frontend", "infrastructure", "e2e"]
+      }
       ```
     </monorepo_structure>
 
@@ -1700,7 +2026,7 @@
     </filter_query_parsing>
 
     <performance_considerations>
-      - Use useLiveQuery for reactive data - auto-optimizes
+      - Use React Query for caching, background refetching, and optimistic updates
       - Paginate large lists if needed (board unlikely to need it)
       - Virtualize very long backlogs (react-window if >100 items)
       - Debounce search input (200ms)
@@ -1714,7 +2040,7 @@
       - Integration tests: full workflows with Cypress or Playwright
       - Manual testing: each integration test scenario
       - Cross-browser: Chrome, Firefox, Safari, Edge
-      - IndexedDB: test data persistence across sessions
+      - API integration: test data persistence via Lambda/DynamoDB
     </testing_strategy>
 
     <playwright_dev_server_requirement>
