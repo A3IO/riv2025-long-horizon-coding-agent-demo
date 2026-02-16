@@ -20,7 +20,7 @@ EXECUTION_ROLE_ARN ?= arn:aws:iam::669298908997:role/claude-code-agentcore-role
 PUSH_INTERVAL_SECONDS ?= 300
 SCREENSHOT_INTERVAL_SECONDS ?= 300
 SESSION_DURATION_HOURS ?= 1.0
-DEFAULT_MODEL ?= us.anthropic.claude-sonnet-4-5-20250929-v1:0
+DEFAULT_MODEL ?= us.anthropic.claude-opus-4-6-v1
 PROJECT_NAME ?= canopy
 
 # OpenTelemetry Configuration
@@ -54,7 +54,7 @@ ECR_URI := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME)
 # GitHub configuration
 GITHUB_REPO ?= KBB99/riv2025-long-horizon-coding-agent-demo
 
-.PHONY: help launch launch-local deploy-infra status destroy show-config update-runtime-env get-runtime cleanup-test stop-session
+.PHONY: help launch launch-local deploy-infra status destroy show-config update-runtime-env get-runtime cleanup-test stop-session reset
 
 help:
 	@echo "AgentCore Management Commands"
@@ -69,6 +69,7 @@ help:
 	@echo "  make show-config       - Show current configuration values"
 	@echo "  make cleanup-test      - Clean up test issues, branches, and S3"
 	@echo "  make stop-session SESSION_ID=xxx - Stop a running agent session"
+	@echo "  make reset             - Wipe all agent state and start fresh"
 	@echo ""
 	@echo "Configuration (override with VAR=value):"
 	@echo "  AWS_PROFILE=$(AWS_PROFILE)"
@@ -259,3 +260,61 @@ stop-session:
 	@echo "🛑 Stopping agent session: $(SESSION_ID)"
 	AWS_PROFILE=$(AWS_PROFILE) AWS_REGION=$(CF_REGION) agentcore stop-session --session-id "$(SESSION_ID)"
 	@echo "✅ Session stop requested"
+
+# Dynamic values for reset (previews bucket and CloudFront distribution)
+PREVIEWS_BUCKET := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='PreviewsBucketName'].OutputValue" --output text 2>/dev/null)
+PREVIEWS_DISTRIBUTION_ID := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='PreviewsDistributionId'].OutputValue" --output text 2>/dev/null)
+SCREENSHOTS_DISTRIBUTION_ID := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='ScreenshotsDistributionId'].OutputValue" --output text 2>/dev/null)
+
+# Reset all agent state to start fresh
+# Deletes agent-runtime branch, closes open issues, clears SSM/S3/CloudFront
+reset:
+	@echo "⚠️  This will wipe all agent state. Press Ctrl+C to abort."
+	@echo ""
+	@echo "1/6 Deleting agent-runtime branch (remote)..."
+	@git push origin --delete agent-runtime 2>/dev/null && echo "     Deleted remote branch" || echo "     Branch not found (ok)"
+	@git branch -D agent-runtime 2>/dev/null && echo "     Deleted local branch" || echo "     Local branch not found (ok)"
+	@echo ""
+	@echo "2/6 Closing all open issues with agent-building label..."
+	@for issue in $$(gh issue list --repo $(GITHUB_REPO) --label "agent-building" --state open --json number --jq '.[].number' 2>/dev/null); do \
+		echo "     Closing issue #$$issue..."; \
+		gh issue close $$issue --repo $(GITHUB_REPO) --comment "Closed by make reset" 2>/dev/null || true; \
+	done
+	@echo ""
+	@echo "3/6 Clearing SSM parameters..."
+	@aws ssm delete-parameter --name "/claude-code/current-issue" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/current-issue" || echo "     /claude-code/current-issue not found (ok)"
+	@aws ssm delete-parameter --name "/claude-code/session-id" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/session-id" || echo "     /claude-code/session-id not found (ok)"
+	@aws ssm delete-parameter --name "/claude-code/infra/deploy-state" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/infra/deploy-state" || echo "     /claude-code/infra/deploy-state not found (ok)"
+	@echo ""
+	@echo "4/6 Clearing S3 screenshots bucket..."
+	@if [ -n "$(SCREENSHOT_BUCKET)" ] && [ "$(SCREENSHOT_BUCKET)" != "None" ]; then \
+		aws s3 rm s3://$(SCREENSHOT_BUCKET)/ --recursive --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Screenshots cleared" || echo "     Bucket empty or not found (ok)"; \
+	else \
+		echo "     Screenshot bucket not found (deploy infra first)"; \
+	fi
+	@echo ""
+	@echo "5/6 Clearing S3 previews bucket..."
+	@if [ -n "$(PREVIEWS_BUCKET)" ] && [ "$(PREVIEWS_BUCKET)" != "None" ]; then \
+		aws s3 rm s3://$(PREVIEWS_BUCKET)/ --recursive --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Previews cleared" || echo "     Bucket empty or not found (ok)"; \
+	else \
+		echo "     Previews bucket not found (deploy infra first)"; \
+	fi
+	@echo ""
+	@echo "6/6 Invalidating CloudFront caches..."
+	@if [ -n "$(PREVIEWS_DISTRIBUTION_ID)" ] && [ "$(PREVIEWS_DISTRIBUTION_ID)" != "None" ]; then \
+		aws cloudfront create-invalidation --distribution-id $(PREVIEWS_DISTRIBUTION_ID) --paths "/*" --region $(CF_REGION) --profile $(AWS_PROFILE) > /dev/null 2>&1 && echo "     Previews CDN cache invalidated" || echo "     Previews CDN invalidation failed (ok)"; \
+	else \
+		echo "     Previews distribution not found (ok)"; \
+	fi
+	@if [ -n "$(SCREENSHOTS_DISTRIBUTION_ID)" ] && [ "$(SCREENSHOTS_DISTRIBUTION_ID)" != "None" ]; then \
+		aws cloudfront create-invalidation --distribution-id $(SCREENSHOTS_DISTRIBUTION_ID) --paths "/*" --region $(CF_REGION) --profile $(AWS_PROFILE) > /dev/null 2>&1 && echo "     Screenshots CDN cache invalidated" || echo "     Screenshots CDN invalidation failed (ok)"; \
+	else \
+		echo "     Screenshots distribution not found (ok)"; \
+	fi
+	@echo ""
+	@echo "✅ Reset complete. Ready for a fresh run."
+	@echo ""
+	@echo "Next steps:"
+	@echo "  1. make launch PROJECT_NAME=myapp   # Launch with your project"
+	@echo "  2. Create a new issue on GitHub"
+	@echo "  3. Add 🚀 reaction to trigger the agent"

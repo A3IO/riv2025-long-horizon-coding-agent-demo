@@ -273,6 +273,25 @@ export class ClaudeCodeStack extends cdk.Stack {
           iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForCloudWatch', agentCoreRoleName),
         ],
       });
+
+      new iam.ManagedPolicy(this, 'AgentCoreXRayPolicy', {
+        description: 'Allows AgentCore execution role to send traces and telemetry to X-Ray',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'xray:PutTraceSegments',
+              'xray:PutTelemetryRecords',
+              'xray:GetSamplingRules',
+              'xray:GetSamplingTargets',
+            ],
+            resources: ['*'],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForXRay', agentCoreRoleName),
+        ],
+      });
     } // end if (agentCoreRoleName)
 
     // ========================================================================

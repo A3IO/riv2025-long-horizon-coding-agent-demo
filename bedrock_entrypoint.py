@@ -1694,7 +1694,7 @@ def run_agent_background(
             print("❌ Cannot start agent without API key (set CLAUDE_CODE_USE_BEDROCK=1 to use Bedrock instead)")
             return
 
-    model = os.environ.get("DEFAULT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    model = os.environ.get("DEFAULT_MODEL", "us.anthropic.claude-opus-4-6-v1")
 
     # Determine working directory and command based on mode
     if build_dir is not None:
