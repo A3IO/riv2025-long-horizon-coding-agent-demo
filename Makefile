@@ -22,6 +22,7 @@ SCREENSHOT_INTERVAL_SECONDS ?= 300
 SESSION_DURATION_HOURS ?= 1.0
 DEFAULT_MODEL ?= us.anthropic.claude-opus-4-6-v1
 PROJECT_NAME ?= canopy
+BASE_BRANCH ?= main
 
 # OpenTelemetry Configuration
 # Based on: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html
@@ -133,6 +134,7 @@ launch:
 		--env "SCREENSHOT_CDN_DOMAIN=$(SCREENSHOT_CDN_DOMAIN)" \
 		--env "SESSION_DURATION_HOURS=$(SESSION_DURATION_HOURS)" \
 		--env "DEFAULT_MODEL=$(DEFAULT_MODEL)" \
+		--env "BASE_BRANCH=$(BASE_BRANCH)" \
 		--env "CLAUDE_CODE_USE_BEDROCK=1" \
 		--env "AWS_REGION=$(AWS_REGION)" \
 		--env "CLAUDE_CODE_ENABLE_TELEMETRY=$(CLAUDE_CODE_ENABLE_TELEMETRY)" \
@@ -156,6 +158,7 @@ launch-local:
 		--env "SCREENSHOT_CDN_DOMAIN=$(SCREENSHOT_CDN_DOMAIN)" \
 		--env "SESSION_DURATION_HOURS=$(SESSION_DURATION_HOURS)" \
 		--env "DEFAULT_MODEL=$(DEFAULT_MODEL)" \
+		--env "BASE_BRANCH=$(BASE_BRANCH)" \
 		--env "CLAUDE_CODE_USE_BEDROCK=1" \
 		--env "AWS_REGION=$(AWS_REGION)" \
 		--env "CLAUDE_CODE_ENABLE_TELEMETRY=$(CLAUDE_CODE_ENABLE_TELEMETRY)" \
@@ -200,6 +203,7 @@ update-runtime-env:
 		--environment-variables '{ \
 			"ENVIRONMENT": "$(ENVIRONMENT)", \
 			"PROJECT_NAME": "$(PROJECT_NAME)", \
+			"BASE_BRANCH": "$(BASE_BRANCH)", \
 			"PUSH_INTERVAL_SECONDS": "$(PUSH_INTERVAL_SECONDS)", \
 			"SCREENSHOT_INTERVAL_SECONDS": "$(SCREENSHOT_INTERVAL_SECONDS)", \
 			"SCREENSHOT_BUCKET": "$(SCREENSHOT_BUCKET)", \

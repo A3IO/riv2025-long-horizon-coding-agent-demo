@@ -380,6 +380,7 @@ GITHUB_BUILD_DIR = Path("/app/github-builds")
 # Agent runtime directory (ephemeral filesystem in AgentCore)
 AGENT_RUNTIME_DIR = Path("/app/workspace/agent-runtime")
 AGENT_BRANCH = "agent-runtime"
+BASE_BRANCH = os.environ.get("BASE_BRANCH", "main")
 
 # Backlog file path (ephemeral - state is recovered from git on session start)
 BACKLOG_FILE_PATH = AGENT_RUNTIME_DIR / "human_backlog.json"
@@ -458,11 +459,11 @@ def setup_agent_runtime(
             raise RuntimeError(f"Git clone timed out after {GIT_TIMEOUT} seconds")
 
         if result.returncode != 0:
-            # Branch doesn't exist - clone main and create the branch
-            print(f"📝 Branch {AGENT_BRANCH} doesn't exist, creating from main...")
+            # Branch doesn't exist - clone base branch and create agent-runtime from it
+            print(f"📝 Branch {AGENT_BRANCH} doesn't exist, creating from {BASE_BRANCH}...")
             try:
                 subprocess.run(
-                    ["git", "clone", clone_url, str(AGENT_RUNTIME_DIR)],
+                    ["git", "clone", "-b", BASE_BRANCH, clone_url, str(AGENT_RUNTIME_DIR)],
                     check=True,
                     timeout=GIT_TIMEOUT
                 )
