@@ -16,6 +16,7 @@ import asyncio
 import boto3
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -24,6 +25,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, List
+
+# Configure Python logging so OTEL auto-instrumentation captures our messages
+# The opentelemetry-instrument wrapper hooks into the logging module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s')
+logger = logging.getLogger("agent.entrypoint")
 
 # OpenTelemetry imports for session ID propagation
 try:
@@ -1686,13 +1692,13 @@ def run_agent_background(
     use_bedrock = os.environ.get("CLAUDE_CODE_USE_BEDROCK", "0") == "1"
 
     if use_bedrock:
-        print("🔧 Using Amazon Bedrock for model inference")
+        logger.info("Using Amazon Bedrock for model inference")
         api_key = None  # Not needed for Bedrock
     else:
         # Fetch API key from Secrets Manager
         api_key = get_anthropic_api_key()
         if not api_key:
-            print("❌ Cannot start agent without API key (set CLAUDE_CODE_USE_BEDROCK=1 to use Bedrock instead)")
+            logger.error("Cannot start agent without API key (set CLAUDE_CODE_USE_BEDROCK=1 to use Bedrock instead)")
             return
 
     model = os.environ.get("DEFAULT_MODEL", "us.anthropic.claude-opus-4-6-v1")
@@ -1722,9 +1728,9 @@ def run_agent_background(
                 "--output-dir", str(build_dir / "generated-app"),
                 "--skip-git-init"  # Don't create nested .git - use cloned repo's git
             ]
-            print(f"📦 Using project: {project_name}")
+            logger.info(f"Using project: {project_name}")
 
-        print(f"🔧 GitHub mode: {'enhancement' if is_enhancement else 'full build'}")
+        logger.info(f"GitHub mode: {'enhancement' if is_enhancement else 'full build'}")
     else:
         # Legacy mode
         cwd = "/app"
@@ -1740,10 +1746,16 @@ def run_agent_background(
         resume_session_id = os.environ.get('RESUME_SESSION_ID')
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
-            print(f"🔄 Resuming session: {resume_session_id}")
+            logger.info(f"Resuming session: {resume_session_id}")
 
-    print(f"📝 Background command: {' '.join(cmd)}")
-    print(f"📁 Working directory: {cwd}")
+    logger.info(f"Background command: {' '.join(cmd)}")
+    logger.info(f"Working directory: {cwd}")
+
+    # Log key environment variables for debugging
+    logger.info(f"CLAUDE_CODE_USE_BEDROCK={os.environ.get('CLAUDE_CODE_USE_BEDROCK', 'NOT SET')}")
+    logger.info(f"AWS_REGION={os.environ.get('AWS_REGION', 'NOT SET')}")
+    logger.info(f"DEFAULT_MODEL={model}")
+    logger.info(f"Running as UID={os.getuid()}, user={os.environ.get('USER', 'unknown')}")
 
     # Set up environment
     env = os.environ.copy()
@@ -1753,15 +1765,30 @@ def run_agent_background(
     else:
         env['ANTHROPIC_API_KEY'] = api_key
 
-    # Start agent subprocess - don't capture output so it goes to CloudWatch
+    # Start agent subprocess - capture stderr to detect early failures
     agent_process = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=env
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
     )
 
-    print(f"✅ Agent started in background (PID: {agent_process.pid})")
-    print(f"📝 Agent output will appear in CloudWatch logs")
+    logger.info(f"Agent started in background (PID: {agent_process.pid})")
+
+    # Monitor subprocess output in a separate thread for logging
+    def _log_subprocess_output():
+        """Read subprocess stdout/stderr and log via Python logging (OTEL-visible)."""
+        try:
+            for line in iter(agent_process.stdout.readline, b''):
+                text = line.decode('utf-8', errors='replace').rstrip()
+                if text:
+                    logger.info(f"[agent] {text}")
+        except Exception as e:
+            logger.error(f"Error reading agent output: {e}")
+
+    output_thread = threading.Thread(target=_log_subprocess_output, daemon=True)
+    output_thread.start()
 
     # Poll for commits and push periodically while agent runs
     # The handler's async generator monitoring loop may not execute if the
@@ -1789,19 +1816,27 @@ def run_agent_background(
                         cwd=str(build_dir), capture_output=True, timeout=60
                     )
                     if result.returncode == 0:
-                        print(f"📤 [background-push] Push successful")
+                        logger.info("[background-push] Push successful")
                     else:
                         stderr = result.stderr.decode()[:200] if result.stderr else ""
                         # "Everything up-to-date" is not an error
                         if "up-to-date" not in stderr:
-                            print(f"⚠️ [background-push] Push failed: {stderr}")
+                            logger.warning(f"[background-push] Push failed: {stderr}")
+                        else:
+                            logger.info("[background-push] Everything up-to-date")
                 else:
-                    print(f"⚠️ [background-push] No token file at {GITHUB_TOKEN_FILE}")
+                    logger.warning(f"[background-push] No token file at {GITHUB_TOKEN_FILE}")
             except Exception as e:
-                print(f"⚠️ [background-push] Error: {e}")
+                logger.error(f"[background-push] Error: {e}")
             last_push = time.time()
 
-    print(f"🏁 Agent completed with exit code: {agent_process.returncode}")
+    logger.info(f"Agent completed with exit code: {agent_process.returncode}")
+
+    # Log any remaining output
+    remaining_output = agent_process.stdout.read().decode('utf-8', errors='replace').strip()
+    if remaining_output:
+        for line in remaining_output.split('\n')[-20:]:  # Last 20 lines
+            logger.info(f"[agent-final] {line}")
 
 
 @app.entrypoint
@@ -1817,21 +1852,20 @@ async def handler(payload: Dict[str, Any], context: Any) -> Iterator[Dict[str, A
     """
     global session_start_time, agent_process, announced_commits, uploaded_screenshots, session_pushed_commits
 
-    print("\n" + "="*80)
-    print("🚀 Bedrock AgentCore Handler Invoked")
-    print("="*80)
-    print(f"Payload: {payload}")
-    print(f"Session ID: {context.session_id}")
-    print("="*80 + "\n")
+    logger.info("=" * 80)
+    logger.info("Bedrock AgentCore Handler Invoked")
+    logger.info(f"Payload: {json.dumps(payload, default=str)[:500]}")
+    logger.info(f"Session ID: {context.session_id}")
+    logger.info("=" * 80)
 
     # Propagate session ID to OpenTelemetry for trace correlation
     if OTEL_AVAILABLE and context.session_id:
         try:
             ctx = baggage.set_baggage("session.id", context.session_id)
             attach(ctx)
-            print(f"✅ Session ID propagated to OpenTelemetry: {context.session_id}")
+            logger.info(f"Session ID propagated to OpenTelemetry: {context.session_id}")
         except Exception as e:
-            print(f"⚠️ Failed to propagate session ID to OpenTelemetry: {e}")
+            logger.warning(f"Failed to propagate session ID to OpenTelemetry: {e}")
 
     # Initialize session start time
     if session_start_time is None:
