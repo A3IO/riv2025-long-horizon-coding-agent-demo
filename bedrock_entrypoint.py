@@ -1763,8 +1763,43 @@ def run_agent_background(
     print(f"✅ Agent started in background (PID: {agent_process.pid})")
     print(f"📝 Agent output will appear in CloudWatch logs")
 
-    # Wait for agent to complete (will run for hours)
-    agent_process.wait()
+    # Poll for commits and push periodically while agent runs
+    # The handler's async generator monitoring loop may not execute if the
+    # AgentCore framework stops consuming it, so we push from this thread too.
+    push_interval = int(os.environ.get("PUSH_INTERVAL_SECONDS", "300"))
+    github_repo = os.environ.get("GITHUB_REPO_FOR_PUSH", "")
+    last_push = time.time()
+
+    while agent_process.poll() is None:
+        time.sleep(30)
+
+        # Periodic push
+        if build_dir and github_repo and (time.time() - last_push) >= push_interval:
+            try:
+                token_path = Path(GITHUB_TOKEN_FILE)
+                if token_path.exists():
+                    token = token_path.read_text().strip()
+                    push_url = f"https://x-access-token:{token}@github.com/{github_repo}.git"
+                    subprocess.run(
+                        ["git", "remote", "set-url", "origin", push_url],
+                        cwd=str(build_dir), capture_output=True, timeout=10
+                    )
+                    result = subprocess.run(
+                        ["git", "push", "-u", "origin", AGENT_BRANCH],
+                        cwd=str(build_dir), capture_output=True, timeout=60
+                    )
+                    if result.returncode == 0:
+                        print(f"📤 [background-push] Push successful")
+                    else:
+                        stderr = result.stderr.decode()[:200] if result.stderr else ""
+                        # "Everything up-to-date" is not an error
+                        if "up-to-date" not in stderr:
+                            print(f"⚠️ [background-push] Push failed: {stderr}")
+                else:
+                    print(f"⚠️ [background-push] No token file at {GITHUB_TOKEN_FILE}")
+            except Exception as e:
+                print(f"⚠️ [background-push] Error: {e}")
+            last_push = time.time()
 
     print(f"🏁 Agent completed with exit code: {agent_process.returncode}")
 
@@ -2052,6 +2087,9 @@ Progress will continue from where the previous session left off.""")
     print(f"📋 Registered async task: {task_id}")
 
     # Start agent in background thread
+    # Pass github_repo via env var so the background push loop can use it
+    if github_repo:
+        os.environ["GITHUB_REPO_FOR_PUSH"] = github_repo
     if agent_process is None or agent_process.poll() is not None:
         thread = threading.Thread(
             target=run_agent_background,
