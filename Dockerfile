@@ -56,9 +56,15 @@ RUN npm install -g @anthropic-ai/claude-code
 # AWS CDK CLI for infrastructure synthesis and testing
 RUN npm install -g aws-cdk
 
-# AWS CLI v2 for deployment verification
+# AWS CLI v2 for deployment verification (detect architecture for cross-platform builds)
 RUN apt-get update && apt-get install -y unzip \
-    && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
+         AWS_CLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"; \
+       else \
+         AWS_CLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"; \
+       fi \
+    && curl "$AWS_CLI_URL" -o "awscliv2.zip" \
     && unzip awscliv2.zip && ./aws/install && rm -rf aws awscliv2.zip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -68,11 +74,16 @@ RUN npm install -g esbuild
 # Install Playwright for browser automation (screenshots, testing)
 RUN npx playwright install chromium
 
-# Create workspace directory (ephemeral in AgentCore)
-RUN mkdir -p /app/workspace
+# Create non-root user for Claude Code CLI (bypassPermissions requires non-root)
+RUN useradd -m -s /bin/bash agent \
+    && mkdir -p /app/workspace /home/agent/.claude \
+    && chown -R agent:agent /app /home/agent
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
+
+# Switch to non-root user
+USER agent
 
 # Initialize workspace with required files at startup
 # Use opentelemetry-instrument to enable ADOT tracing for AgentCore observability

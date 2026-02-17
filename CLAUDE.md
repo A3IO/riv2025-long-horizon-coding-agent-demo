@@ -78,7 +78,7 @@ make show-config   # look for ECR_URI
 #    Login, build, push:
 aws ecr get-login-password --region us-east-1 --profile default | \
   docker login --username AWS --password-stdin <ECR_URI>
-docker build -t <ECR_URI>:latest .
+docker build --platform linux/arm64 -t <ECR_URI>:latest .
 docker push <ECR_URI>:latest
 
 # 3. (Optional) Update runtime env vars if they changed
