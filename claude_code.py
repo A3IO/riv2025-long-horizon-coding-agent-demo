@@ -991,22 +991,17 @@ def _create_claude_client(
     cli_path = "/usr/local/bin/claude" if os.path.exists("/usr/local/bin/claude") else None
 
     # Build environment variables for the SDK subprocess
-    # Forward AWS credentials so the Claude CLI can authenticate with Bedrock
+    # Note: The SDK merges env with os.environ ({**os.environ, **env}),
+    # so we only need to set Bedrock-specific overrides
     sdk_env = {}
     if os.environ.get("CLAUDE_CODE_USE_BEDROCK") == "1":
         sdk_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         sdk_env["AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
-        # Forward IAM credentials from the AgentCore execution role
-        for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-                     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-                     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-                     "AWS_CONTAINER_AUTHORIZATION_TOKEN"]:
-            if key in os.environ:
-                sdk_env[key] = os.environ[key]
 
     options_kwargs = dict(
         model=args.model,
         system_prompt=system_prompt,
+        permission_mode="bypassPermissions",
         cli_path=cli_path,  # Explicitly set for Docker compatibility
         allowed_tools=[
             "think",
