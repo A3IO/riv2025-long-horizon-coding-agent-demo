@@ -1230,36 +1230,57 @@ This lets you detect when infrastructure has been redeployed (see continuation s
 
 """
             message += """
-You absolutely must start by writing a detailed testing plan in tests.json. This should include at least 200 extremely detailed end-to-end tests that must be completed using Playwright CLI for screenshots and manual verification. The JSON file should be an array of objects in this format:
+Start implementation with Phase 1 (shared contract) BEFORE writing any frontend code. Follow the Phased Execution order in the system prompt strictly.
+
+Write a testing plan in tests.json with ~50 tests covering all phases. The JSON file should be an array of objects in this format:
 [
-  {"category": "functional",
-    "description": "User can sign in and navigate to the home page",
+  {"category": "shared",
+    "description": "Shared schemas compile with no TypeScript errors",
     "steps": [
-      "Navigate to the sign-in page",
-      "Enter credentials",
-      "Click sign-in button",
-      "Verify redirection to home page"
+      "Run cd shared && npx tsc --noEmit",
+      "Verify exit code 0"
+    ],
+    "passes": false
+  },
+  {"category": "infrastructure",
+    "description": "CDK stack synthesizes successfully",
+    "steps": [
+      "Run cd infrastructure && npx cdk synth",
+      "Verify CloudFormation template is produced"
+    ],
+    "passes": false
+  },
+  {"category": "backend",
+    "description": "Lambda handler returns correct response for valid input",
+    "steps": [
+      "Import handler from backend/src/handlers/",
+      "Call with valid request body",
+      "Verify 200 response with expected shape"
+    ],
+    "passes": false
+  },
+  {"category": "functional",
+    "description": "User can navigate to the home page and see content",
+    "steps": [
+      "Navigate to the home page",
+      "Take a screenshot",
+      "Verify main content is visible"
     ],
     "passes": false
   },
   {"category": "style",
-    "description": "Sign-in component is perfectly formatted, well-spaced, clean, and modern",
+    "description": "Home page is well-designed with proper spacing and typography",
     "steps": [
-      "Navigate to the sign-in page",
+      "Navigate to the home page",
       "Take a screenshot",
-      "Verify that the forms and buttons on the sign-in page are well-spaced",
-      "Verify redirection to home page"
+      "Verify layout, spacing, and typography are polished"
     ],
     "passes": false
   },
   ...
 ]
 
-There should be distinct tests for both functionality and style/UI quality. For example, a good end-to-end test case is 'Navigated to Page X. Clicked the Search Bar. Inputted Text. Clicked the Search button. Saw Successful search results.'. You can only mark a test as complete once you have successfully completed a run through the web site and reviewed the screenshots.
-
-There should be a good mix of both short and very long functional tests. A functional test can span as many as 20 steps. For example, a long functional test may require logging in to the app, opening a DM with another user, sending a message, starting a thread in that message, replying in that thread, and seeing the AI response in that thread. At least 25 of the tests MUST have at least 10 steps.
-
-Order the tests with the most fundamental functionality first, and the most advanced features last. This way, you can build up the app piece by piece and verify that the core functionality is working before moving on to more advanced features. You should also start with a foundation for a beautiful, modern design.
+The first ~10 tests should verify shared/ schema compilation and backend handler responses. The next ~10 should verify infrastructure (CDK synth, CDK tests pass, stack outputs correct). The remaining ~30 should cover frontend UI functionality and styling. Order tests with the most fundamental phases first.
 
 Make sure you don't miss anything! It's extremely important that we implement every feature so that this is a fully production-quality website with no bugs. You have unlimited time, so take as long as you need to get everything perfect. This is not a demo, it's a production-quality final product.
 
@@ -1392,7 +1413,7 @@ If `init.sh` already exists, you should run it to restart the servers. Otherwise
 
 `init.sh` should start by running a unit test suite. You should add to this unit test suite as you add new features, and make sure it continues to pass all tests before moving on to Playwright tests.
 
-CRITICAL: YOU CAN ONLY CHANGE ONE LINE OF THE tests.json FILE AT A TIME. THE ONLY CHANGES YOU CAN MAKE TO THE TESTS IS CHANGING THE "passes" FIELD, AND YOU MAY ONLY DO THIS WHEN YOU HAVE VERIFIED THAT A TEST PASSES BY DOING THE TESTING YOURSELF. IT IS CATASTROPHIC TO REMOVE OR EDIT TESTS BECAUSE THIS MEANS THAT FUNCTIONALITY COULD BE MISSING OR BUGGY.
+When updating tests.json, only change the "passes" field after verifying each test yourself. Do not remove or rewrite existing tests.
 
 **IMPORTANT**: If human_backlog.json exists, prioritize items in this order:
 1. Items with status "in progress" - finish what was started
@@ -1403,18 +1424,11 @@ CRITICAL: YOU CAN ONLY CHANGE ONE LINE OF THE tests.json FILE AT A TIME. THE ONL
 
 These are explicit human requests that take precedence over general test completion work.
 
-Since this is a continuation session, you should be very skeptical about the current state of the project. The last session may have broken tests that were marked as complete. After reading the progress notes, you should start the session by running through 1-2 of the longest and most fundamental functional tests that are marked as complete, if any are. If this verification shows any issues at all, you should immediately mark the test as "passes": false and work on fixing it before moving on to new features. This includes UI bugs: if you see issues, you should fix those immediately. Make a list of any UI imperfections that you see and prioritize those above adding new functionality.
-
-Check for a list of UI bugs like the following:
- 1. white-on-white or otherwise hard to read text
- 2. random characters being displayed (e.g. "0" randomly placed after a username)
- 3. message timestamps being reported in the future
- 4. sidebars not being displayed due to components overflowing with no scrolling
- 5. buttons or text being too close together or overlapping
+Since this is a continuation session, do a quick sanity check after reading progress notes: run 1-2 previously-passing tests to confirm nothing regressed. If something broke, fix it before adding new features.
 
 An example of a test that verifies fundamental functionality is {example_test}
 
-Your goal is ultimately to have a perfect UI and to get all the tests checked off, and in this session, you should try to make incremental progress towards that goal. Once you've read the progress file and the git history and verified basic functionality, you should start with the most critical uncompleted test and try to get it working, then move on to the next one only when it's perfectly done.
+Your goal is to make incremental progress: verify the phase gates pass (shared compiles, infrastructure synths, backend builds, frontend builds), then work on the most critical uncompleted test.
 
 **The Boy Scout Rule: Leave It Better Than You Found It**
 Before you end your session, it is MANDATORY for you to take a moment to scan your changes. Did you add appropriate tests for your new code? Are files organized according to the project's structure? If you touched existing code, did you clean up any unused or outdated pieces you spotted along the way? Did you create many files when you could have consolidated them?

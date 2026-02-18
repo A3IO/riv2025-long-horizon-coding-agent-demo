@@ -115,6 +115,8 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 </design_approach>
 
 ## Backend Development
+- Import Zod schemas from `@canopy/shared` for input validation — do NOT redefine types in backend
+- Validate request bodies with `.parse()` and return responses that satisfy shared response schemas
 - Write Lambda handlers in TypeScript with proper input validation (zod)
 - Use the AWS SDK v3 (@aws-sdk/client-dynamodb, @aws-sdk/lib-dynamodb)
 - Design DynamoDB tables with single-table design patterns
@@ -140,6 +142,37 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 - Run tests with `npm test` in the infrastructure directory
 - All tests must pass before committing infrastructure changes
 
+## Phased Execution
+
+Follow this strict implementation order. Do NOT skip ahead to frontend UI before the contract and backend are in place.
+
+### Phase 1: Shared Contract (DO FIRST)
+- Write all Zod schemas in `shared/schemas/`
+- Export inferred types from `shared/types.ts`
+- Define the endpoint route map in `shared/endpoints.ts`
+- Verify compilation: `cd shared && npx tsc --noEmit`
+- Commit: "feat: add shared API contract with Zod schemas"
+
+### Phase 2: Infrastructure + Backend
+- Write CDK stack (DynamoDB, Lambda, API GW, S3/CloudFront)
+- Write CDK tests (snapshot + assertions)
+- Write Lambda handlers that import from `@canopy/shared` for validation
+- Each handler validates input with Zod `.parse()`, returns typed responses
+- Commit after CDK, commit after handlers
+
+### Phase 3: Frontend
+- Build API client layer importing types from `@canopy/shared`
+- Build React Query hooks wrapping the API client
+- Build UI components consuming the hooks
+- Frontend MUST use the shared types — no duplicate type definitions
+
+### Phase 4: Integration + Polish
+- E2E tests against the running frontend
+- Dark theme, animations, keyboard shortcuts
+- Performance optimization, final polish
+
+CRITICAL: If you find yourself writing frontend components before Phase 1 is committed, STOP and go back to the contract.
+
 ## Core Instructions
 
 All files you create *MUST* be placed in the current working directory. Feel free to create subdirectories like `src/`, `public/`, and `tests/` to help organize your code.
@@ -160,11 +193,11 @@ Before each commit, please write a summary of what you have done and what there 
 
 ## Testing and Quality
 
-You will primarily be graded on a comprehensive set of hidden tests. There may be a smaller reward component from a preference model which evaluates the quality of the code you produce: for example, how readable it is, whether its internal abstractions make sense, testing quality, etc.
+Your work is evaluated on phase completeness. A working shared/ + infrastructure/ + backend/ with a basic frontend scores higher than a polished frontend with no backend. A separate QA agent will perform thorough end-to-end testing and file issues for any problems found.
 
 I strongly recommend that you set up a way to easily measure the fraction of example tests your code passes, broken out by category, since this should be very helpful when deciding what to work on next. I also recommend that you write your own tests and set up clean automated testing infrastructure: this is a very long task, and doing so will save you a lot of work and prevent a lot of regressions over the course of your work.
 
-You will be graded on the quality of the GUI in the browser. The interface should be beautiful and modern. If you are testing an interface and see a screenshot that is not absolutely perfect, you should stop and get the interface to be pixel-perfect before proceeding with more functionality.
+The interface should be beautiful and modern, but only after the backend and infrastructure are in place. Do not spend time on pixel-perfect UI polish until Phase 3.
 
 ## Work Process
 
@@ -174,43 +207,24 @@ Start by checking if claude-progress.txt exists to see what work has been done p
 
 You have absolutely unlimited time, so in this session it's ok to implement only one feature at a time, commit, and then continue on another small feature, if that continues to make progress.
 
-## Test Verification (CRITICAL - ENFORCED BY SYSTEM)
+## Test Verification
 
-For EACH test in tests.json, you MUST follow this exact process:
+Verify each major feature works with a screenshot before moving to the next phase. Use the playwright-test helper for screenshot + console verification:
 
-1. **Read the test steps** from tests.json
-2. **Execute the test** by performing the steps in the browser
-3. **Take a screenshot AND capture console output** using the playwright-test helper:
-   ```bash
-   node playwright-test.cjs --url http://localhost:6174 --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
-   ```
+```bash
+node playwright-test.cjs --url http://localhost:6174 --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
+```
 
-   This single command creates both:
-   - `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-<timestamp>.png` (screenshot)
-   - `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
+This creates both:
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-<timestamp>.png` (screenshot)
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
 
-   For pages with routes, include the path in the URL:
-   ```bash
-   node playwright-test.cjs --url http://localhost:6174/settings --test-id settings-v1 --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
-   ```
+For pages with routes, include the path in the URL:
+```bash
+node playwright-test.cjs --url http://localhost:6174/settings --test-id settings-v1 --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
+```
 
-4. **View the screenshot** using the Read tool to verify expected behavior
-5. **View the console log** using the Read tool to verify NO_CONSOLE_ERRORS
-6. **Fix any console errors** before proceeding - a test CANNOT pass with console errors
-7. **ONLY THEN** mark the test as passing using the Edit tool
-
-**THE SYSTEM WILL BLOCK YOUR EDIT IF:**
-- No screenshot exists with the test ID in the filename
-- No console log file exists (`<TEST_ID>-console.txt`)
-- You haven't viewed (Read) both the screenshot AND console log
-- The test ID cannot be determined from your edit
-
-**CRITICAL RULES:**
-- You MUST NOT bulk-update tests.json (sed/awk/jq/python/node are ALL BLOCKED)
-- You MUST take AND view BOTH screenshot AND console log for each test
-- Console log MUST show `NO_CONSOLE_ERRORS` - fix any errors first!
-- Each test must have: `<TEST_ID>-*.png` AND `<TEST_ID>-console.txt`
-- If there are console errors, FIX THEM before marking the test as passing
+After taking a screenshot, view it with the Read tool and fix any console errors before marking the test as passing. Do not bulk-update tests.json — verify and update tests one at a time.
 
 ### Advanced Testing with Playwright Test
 
@@ -250,11 +264,12 @@ For complex test scenarios that require programmatic interactions (clicks, form 
 
 ## Signaling Completion
 
-Before signaling completion, ALL of these must be true:
-1. `npm run build` succeeds without errors (REQUIRED - do not proceed if build fails)
-2. All pages/features you implemented are verified working (not blank, not erroring)
-3. Each test in tests.json has been individually verified and marked as passing
-4. No known broken features - if you discover something broken, FIX IT before completing
+Before signaling completion, ALL of these phase gates must pass:
+1. `shared/` compiles: `cd shared && npx tsc --noEmit`
+2. `infrastructure/` synths: `cd infrastructure && npx cdk synth`
+3. `backend/` builds: `cd backend && npx tsc --noEmit`
+4. `frontend/` builds: `npm run build`
+5. UI screenshot verification: take screenshots of each major page and fix obvious issues
 
 Only after meeting ALL requirements:
 1. Take a final screenshot: `mkdir -p screenshots/issue-$ISSUE_NUMBER && npx playwright screenshot http://localhost:6174 screenshots/issue-$ISSUE_NUMBER/final-<hash>.png`
@@ -266,10 +281,11 @@ Only after meeting ALL requirements:
 The application is fully built and all features are working.
 
 **DO NOT signal completion if:**
-- Build is failing
-- Any page shows blank/errors
+- Any phase gate is failing
+- shared/ or backend/ doesn't compile
+- infrastructure/ doesn't synth
+- Frontend build is failing
 - You found issues but didn't fix them
-- You used sed/awk to bulk-modify tests.json
 
-This message signals the session manager that you have finished this issue. Do NOT output this message until ALL tests pass and ALL features are working correctly.
+This message signals the session manager that you have finished this issue. Do NOT output this message until ALL phase gates pass and ALL features are working correctly.
 
