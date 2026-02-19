@@ -240,6 +240,43 @@ export class ClaudeCodeStack extends cdk.Stack {
         ],
       });
 
+      new iam.ManagedPolicy(this, 'AgentCoreBackendTestPolicy', {
+        description: 'Allows AgentCore execution role to read DynamoDB, CloudWatch Logs, and invoke Lambda for backend test verification',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:GetItem', 'dynamodb:BatchGetItem',
+            ],
+            resources: [
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/canopy-*`,
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/canopy-*/index/*`,
+            ],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'logs:FilterLogEvents', 'logs:GetLogEvents',
+              'logs:DescribeLogGroups', 'logs:DescribeLogStreams',
+            ],
+            resources: [
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/canopy-*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/canopy-*:*`,
+            ],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['lambda:InvokeFunction'],
+            resources: [
+              `arn:aws:lambda:${this.region}:${this.account}:function:canopy-*`,
+            ],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForBackendTest', agentCoreRoleName),
+        ],
+      });
+
       new iam.ManagedPolicy(this, 'AgentCoreBedrockInvokePolicy', {
         description: 'Allows AgentCore execution role to invoke Bedrock models',
         statements: [

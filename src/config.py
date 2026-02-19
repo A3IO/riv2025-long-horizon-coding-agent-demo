@@ -78,7 +78,7 @@ ALLOWED_BASH_COMMANDS = [
 
 # Special command patterns
 ALLOWED_RM_COMMANDS = ["rm -rf node_modules"]
-ALLOWED_NODE_PATTERNS = ["server.js", "server/index.js", "playwright-test.cjs"]
+ALLOWED_NODE_PATTERNS = ["server.js", "server/index.js", "playwright-test.cjs", "backend-verify.cjs"]
 ALLOWED_PKILL_PATTERNS = [
     'pkill -f "node server/index.js"',
     'pkill -f "node server.js"',

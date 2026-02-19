@@ -1282,6 +1282,19 @@ Write a testing plan in tests.json with ~50 tests covering all phases. The JSON 
 
 The first ~10 tests should verify shared/ schema compilation and backend handler responses. The next ~10 should verify infrastructure (CDK synth, CDK tests pass, stack outputs correct). The remaining ~30 should cover frontend UI functionality and styling. Order tests with the most fundamental phases first.
 
+**Backend tests use `backend-verify.cjs`** (not playwright-test.cjs). For shared/infra/backend tests:
+```bash
+node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"
+```
+Then Read both the -result.txt and -console.txt files before marking as passing.
+
+**VITE_API_URL wiring**: After infrastructure deploys and you discover the API URL from SSM:
+```bash
+API_URL=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.apiUrl')
+echo "VITE_API_URL=$API_URL" > frontend/.env
+```
+Then restart the frontend dev server so it picks up the new environment variable. The frontend API client should use `import.meta.env.VITE_API_URL` as the base URL.
+
 Make sure you don't miss anything! It's extremely important that we implement every feature so that this is a fully production-quality website with no bugs. You have unlimited time, so take as long as you need to get everything perfect. This is not a demo, it's a production-quality final product.
 
 If a file called `human_backlog.json` exists in the project root, check it for any specific feature requests or bug fixes that a human has explicitly requested. These should be prioritized based on priority and status. The file format is a JSON array with items like:
@@ -1426,7 +1439,22 @@ These are explicit human requests that take precedence over general test complet
 
 Since this is a continuation session, do a quick sanity check after reading progress notes: run 1-2 previously-passing tests to confirm nothing regressed. If something broke, fix it before adding new features.
 
-An example of a test that verifies fundamental functionality is {example_test}
+**Test verification by category:**
+- **shared/infrastructure/backend tests** → use `backend-verify.cjs`:
+  `node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"`
+  Then Read both -result.txt and -console.txt before marking as passing.
+- **frontend/style tests** → use `playwright-test.cjs`:
+  `node playwright-test.cjs --url http://localhost:{args.frontend_port} --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full`
+  Then Read both the screenshot PNG and -console.txt before marking as passing.
+
+An example of tests that verify fundamental functionality: {example_test}
+
+**VITE_API_URL wiring**: If the frontend needs to talk to the deployed API, create `frontend/.env` with:
+```
+VITE_API_URL=<API_URL from SSM deploy-state>
+```
+Discover the API URL: `aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.apiUrl'`
+Then restart the frontend dev server for the env var to take effect.
 
 Your goal is to make incremental progress: verify the phase gates pass (shared compiles, infrastructure synths, backend builds, frontend builds), then work on the most critical uncompleted test.
 

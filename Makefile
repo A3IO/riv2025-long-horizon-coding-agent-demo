@@ -22,7 +22,7 @@ SCREENSHOT_INTERVAL_SECONDS ?= 300
 SESSION_DURATION_HOURS ?= 1.0
 DEFAULT_MODEL ?= us.anthropic.claude-opus-4-6-v1
 PROJECT_NAME ?= canopy
-BASE_BRANCH ?= main
+BASE_BRANCH ?= kb/improved-harness
 
 # OpenTelemetry Configuration
 # Based on: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html
@@ -278,7 +278,7 @@ reset:
 	@echo "⚠️  This will wipe all agent state. Press Ctrl+C to abort."
 	@echo ""
 	@echo "1/6 Deleting agent-runtime branch (remote)..."
-	@git push origin --delete agent-runtime 2>/dev/null && echo "     Deleted remote branch" || echo "     Branch not found (ok)"
+	@gh api -X DELETE repos/$(GITHUB_REPO)/git/refs/heads/agent-runtime 2>/dev/null && echo "     Deleted remote branch" || echo "     Branch not found (ok)"
 	@git branch -D agent-runtime 2>/dev/null && echo "     Deleted local branch" || echo "     Local branch not found (ok)"
 	@echo ""
 	@echo "2/6 Closing all open issues with agent-building label..."

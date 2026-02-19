@@ -2,7 +2,7 @@
 
 This file provides context for Claude Code sessions working on this repository.
 
-## Current State (2026-02-18)
+## Current State (2026-02-19)
 
 ### What's Working
 
@@ -13,9 +13,56 @@ The end-to-end pipeline is fully operational:
 - deploy-preview workflow builds the app and deploys to CloudFront
 - Agent subprocess output is visible in CloudWatch via Python logging/OTEL
 
-### What's Not Working
+### Phase Ordering Fix (issue #17)
 
-The agent ignores the phased execution plan (shared/ → backend/ → frontend/). On the last run (issue #14), it built a **frontend-only** React app with Dexie/IndexedDB local storage instead of the full-stack monorepo with Zod schemas, Lambda handlers, and CDK infrastructure. It got 192/192 tests passing but none of the backend or infrastructure exists. The BUILD_PLAN and system prompt need stronger guardrails to force the agent to build `shared/` and `infrastructure/` before touching frontend code.
+The agent previously ignored the phased execution plan (shared/ → backend/ → frontend/). On issue #14, it built a **frontend-only** React app with Dexie/IndexedDB local storage instead of the full-stack monorepo.
+
+**Root cause:** The system prompt incentivized UI quality ("graded on quality of GUI", "pixel-perfect") and demanded 200+ tests upfront, causing the agent to rationally build a testable frontend-only app.
+
+**Fix applied (commit `8dfdae7`):**
+- Replaced grading language with phase-completion incentives ("working shared/ + infrastructure/ + backend/ scores higher than polished frontend with no backend")
+- Reduced test count from 200 to ~50, weighted toward backend/infra categories (shared, infrastructure, backend, then frontend)
+- Added Phased Execution section to canopy-specific system prompt (was only in top-level)
+- Added `@canopy/shared` import requirements to canopy Backend Development section
+- Replaced "all tests must pass" completion gates with phase gates (shared compiles, infra synths, backend builds, frontend builds)
+- Simplified test verification (removed "SYSTEM WILL BLOCK YOUR EDIT" enforcement language)
+- Softened continuation message (removed one-line-at-a-time test enforcement, reduced verification paranoia)
+
+**Result (issue #17):** Agent's first commit was `feat: add shared API contract, CDK infrastructure, and Lambda handlers` — it built shared/ + infra + backend before touching frontend. Two sessions, 10 commits, live preview deployed.
+
+### Next Investigation: Why are tests still 100% frontend?
+
+**The problem:** Despite the prompt asking for ~50 tests with the first ~20 covering shared/infra/backend, the agent wrote 220 tests that are ALL frontend UI tests. Zero `shared`, `infrastructure`, or `backend` category tests. The phase ordering fix worked (it built the backend first), but the test composition is still entirely UI-biased.
+
+**Hypothesis:** The bias may not come from the system prompt alone. There may be something else in the pipeline that prepopulates or biases toward frontend tests. Investigate these in order:
+
+1. **`frontend-scaffold-template/`** — This template is copied into `generated-app/` before the agent starts. Check if it includes a `tests.json` or any test scaffolding that's frontend-only. If the agent sees existing frontend test patterns, it will follow them.
+   - Look at: `frontend-scaffold-template/` directory contents (already in the repo)
+   - Key question: Does the template include any `tests.json`, `playwright-test.cjs`, or example test files?
+
+2. **`prompts/canopy/EXAMPLE_TEST.txt`** — This file is loaded by `load_example_test()` in `claude_code.py:70-95` and injected into the continuation message. If it only shows frontend test examples, the agent learns that pattern.
+   - Look at: `prompts/canopy/EXAMPLE_TEST.txt` (if it exists)
+   - Also check: `prompts/EXAMPLE_TEST.txt` (top-level fallback)
+
+3. **`prompt_template.txt`** — Loaded in `create_thyme_style_message()` at `claude_code.py:475`. This is injected into every initial message. May contain test-related instructions.
+   - Look at: `prompt_template.txt` in the repo root
+
+4. **`claude_code.py` initial message (lines 1232-1327)** — The test format examples we changed show `shared`, `infrastructure`, `backend`, `functional`, `style` categories. But check if the agent is actually seeing these examples or if something else overwrites them. The `create_thyme_style_message()` call at line 1192 builds the base message from BUILD_PLAN, then lines 1232+ append the test instructions. Verify the final assembled message includes the backend test examples.
+
+5. **`prompts/canopy/BUILD_PLAN.md`** — The build plan itself may describe features in a way that only suggests frontend tests. If the test section of the build plan lists UI acceptance criteria but no backend test criteria, the agent will write UI tests.
+   - Look at: `prompts/canopy/BUILD_PLAN.md` — search for any test-related sections
+
+6. **The `playwright-test.cjs` helper** — The test verification workflow is entirely screenshot-based (take screenshot, view it, mark passing). This workflow only makes sense for frontend tests. There's no equivalent "run this backend test and verify" workflow described. The agent may be writing only tests it knows how to verify.
+   - Consider: Should we add a backend test verification workflow? e.g., `cd backend && npm test` or `cd shared && npx tsc --noEmit` as verifiable test steps?
+
+**Other remaining issues:**
+- All 220 tests are marked `"passes": false` in the final tests.json despite the progress file claiming they all pass — the batch-marking commit may have had issues
+- A separate QA agent is planned to handle thorough end-to-end testing
+
+**Files changed in the last session (commit `8dfdae7` on `kb/improved-harness`):**
+- `prompts/system_prompt.txt` — Testing/Quality, Test Verification, Signaling Completion sections
+- `prompts/canopy/system_prompt.txt` — Same + added Phased Execution section + @canopy/shared imports
+- `claude_code.py` — Initial message (lines ~1232-1327) and continuation message (line ~1416)
 
 ### Key Config
 
@@ -95,7 +142,9 @@ make stop-session SESSION_ID=<session-id-from-issue-comment>
 2. **`print()` is invisible in CloudWatch** — only Python `logging` module output gets captured by OTEL auto-instrumentation. Use `logger.info()` for anything you need to see.
 3. **Docker images must be ARM64** — AgentCore runs on Graviton. Always build with `--platform linux/arm64`.
 4. **`bypassPermissions` requires non-root** — the Claude CLI refuses `--dangerously-skip-permissions` when running as root. The Dockerfile creates a non-root `agent` user (UID 1000).
-5. **The agent takes 30-40 min before its first commit** — it builds up a large batch of files before committing. The background push loop and post-commit hook handle pushing once commits exist.
+5. **The agent takes 20-30 min before its first commit** — it builds up a large batch of files before committing. The background push loop and post-commit hook handle pushing once commits exist.
+6. **Incentives shape agent behavior more than instructions** — saying "graded on UI quality" and "200 tests" caused the agent to skip backend/infra entirely and build a frontend-only app. Replacing grading language with phase-completion scoring fixed the build order immediately (issue #17 vs #14).
+7. **Test count suggestions are weak constraints** — asking for "~50 tests" still produced 210+. If strict test count control is needed, it may require enforcement in the harness code rather than the prompt.
 
 ## Architecture
 

@@ -123,6 +123,18 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 - Always handle errors gracefully and return appropriate HTTP status codes
 - Use environment variables for table names and configuration (never hardcode)
 
+### Resource Naming Convention
+All AWS resources MUST be prefixed with `canopy-`. This is required because the agent's IAM permissions are scoped to `canopy-*` resources only. If you name a resource without this prefix, you will not be able to read from it to verify tests.
+
+Examples:
+- DynamoDB tables: `canopy-projects-table`, `canopy-users-table`
+- Lambda functions: `canopy-create-project`, `canopy-list-projects`
+- CloudFormation stack: `canopy-app-stack`
+
+CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda functions are prefixed correctly.
+
+**If you name a table `ProjectsTable` instead of `canopy-projects-table`, `aws dynamodb scan` will be blocked by IAM.**
+
 ## Infrastructure as Code
 - Write CDK stacks in TypeScript using aws-cdk-lib v2
 - Follow least-privilege IAM patterns
@@ -225,6 +237,60 @@ node playwright-test.cjs --url http://localhost:6174/settings --test-id settings
 ```
 
 After taking a screenshot, view it with the Read tool and fix any console errors before marking the test as passing. Do not bulk-update tests.json — verify and update tests one at a time.
+
+### Backend Test Verification
+
+For shared/, infrastructure/, and backend/ tests, use `backend-verify.cjs` instead of playwright-test.cjs. This script runs a shell command and produces verification artifacts in the same format the security system expects.
+
+```bash
+node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"
+```
+
+This creates:
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-result.txt` (verification result with PASS/FAIL)
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
+
+**Examples by category:**
+
+Shared schema compilation:
+```bash
+node backend-verify.cjs --test-id shared-schemas-compile --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd shared && npx tsc --noEmit"
+```
+
+CDK synthesis:
+```bash
+node backend-verify.cjs --test-id cdk-synth --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd infrastructure && npx cdk synth"
+```
+
+CDK tests:
+```bash
+node backend-verify.cjs --test-id cdk-tests --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd infrastructure && npm test"
+```
+
+API endpoint verification (after infrastructure is deployed):
+```bash
+node backend-verify.cjs --test-id api-list-projects --output-dir screenshots/issue-$ISSUE_NUMBER --command "curl -s -w '\n%{http_code}' $API_URL/projects"
+```
+
+DynamoDB data verification:
+```bash
+node backend-verify.cjs --test-id dynamo-has-data --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws dynamodb scan --table-name canopy-projects-table --max-items 1 --region us-east-1"
+```
+
+CloudWatch log verification:
+```bash
+node backend-verify.cjs --test-id lambda-logs-exist --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws logs filter-log-events --log-group-name /aws/lambda/canopy-create-project --max-events 5 --region us-east-1"
+```
+
+Lambda direct invocation:
+```bash
+node backend-verify.cjs --test-id lambda-invoke --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws lambda invoke --function-name canopy-create-project --payload '{\"body\":\"{\\\"name\\\":\\\"test\\\"}\"}' /tmp/lambda-out.json --region us-east-1 && cat /tmp/lambda-out.json"
+```
+
+After running backend-verify.cjs, view both the -result.txt and -console.txt files with the Read tool, then mark the test as passing if RESULT: PASS.
+
+**Use backend-verify.cjs for:** shared compilation, CDK synth/tests, API endpoint checks, DynamoDB scans, CloudWatch log checks, Lambda invocations.
+**Use playwright-test.cjs for:** UI screenshots, browser console errors, visual verification.
 
 ### Advanced Testing with Playwright Test
 
