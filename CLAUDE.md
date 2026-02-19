@@ -145,6 +145,8 @@ make stop-session SESSION_ID=<session-id-from-issue-comment>
 5. **The agent takes 20-30 min before its first commit** — it builds up a large batch of files before committing. The background push loop and post-commit hook handle pushing once commits exist.
 6. **Incentives shape agent behavior more than instructions** — saying "graded on UI quality" and "200 tests" caused the agent to skip backend/infra entirely and build a frontend-only app. Replacing grading language with phase-completion scoring fixed the build order immediately (issue #17 vs #14).
 7. **Test count suggestions are weak constraints** — asking for "~50 tests" still produced 210+. If strict test count control is needed, it may require enforcement in the harness code rather than the prompt.
+8. **CDK `agentCoreRoleName` must match the container's execution role** — The container runs as `claude-code-agentcore-role`, NOT the `AmazonBedrockAgentCoreSDKRuntime-*` role. If you pass the wrong role name to `cdk deploy -c agentCoreRoleName=...`, the Secrets Manager / SSM / CloudWatch policies attach to the wrong role and the container silently crashes (no logs after handler init). The Makefile's `deploy-infra` target now passes the correct defaults automatically.
+9. **CDK deploy without `vpcId` creates a new VPC** — The account has a VPC limit. Always pass `-c vpcId=vpc-04be60df8488bb6e5` (or use `make deploy-infra` which does this automatically).
 
 ## Architecture
 

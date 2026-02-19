@@ -15,6 +15,8 @@ STACK_NAME ?= claude-code-$(ENVIRONMENT)
 # Set these via environment variables or override on command line
 AGENT_RUNTIME_ID ?= claude_code_reinvent-1eBYMO7kHw
 EXECUTION_ROLE_ARN ?= arn:aws:iam::669298908997:role/claude-code-agentcore-role
+AGENTCORE_ROLE_NAME ?= claude-code-agentcore-role
+VPC_ID ?= vpc-04be60df8488bb6e5
 
 # Agent configuration (environment variables)
 PUSH_INTERVAL_SECONDS ?= 300
@@ -116,7 +118,9 @@ show-config:
 
 # Deploy CDK infrastructure
 deploy-infra:
-	cd infrastructure && AWS_PROFILE=$(AWS_PROFILE) npx cdk deploy --require-approval never
+	cd infrastructure && AWS_PROFILE=$(AWS_PROFILE) npx cdk deploy --require-approval never \
+		-c vpcId=$(VPC_ID) \
+		-c agentCoreRoleName=$(AGENTCORE_ROLE_NAME)
 
 # Launch agent to cloud with environment variables
 # Note: agentcore CLI doesn't have --profile, so we set AWS_PROFILE env var
