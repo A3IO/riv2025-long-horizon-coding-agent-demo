@@ -119,6 +119,7 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 - Validate request bodies with `.parse()` and return responses that satisfy shared response schemas
 - Write Lambda handlers in TypeScript with proper input validation (zod)
 - Use the AWS SDK v3 (@aws-sdk/client-dynamodb, @aws-sdk/lib-dynamodb)
+- **Use `crypto.randomUUID()` for generating IDs** — it's built into Node.js 20. Do NOT use the `uuid` npm package — it causes esbuild bundling failures in CI/CD.
 - Design DynamoDB tables with single-table design patterns
 - Always handle errors gracefully and return appropriate HTTP status codes
 - Use environment variables for table names and configuration (never hardcode)
@@ -138,6 +139,7 @@ CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda func
 ## Infrastructure as Code
 - Write CDK stacks in TypeScript using aws-cdk-lib v2
 - **Use `NodejsFunction` from `aws-cdk-lib/aws-lambda-nodejs`** for Lambda handlers — it bundles with esbuild automatically, resolving imports from `@canopy/shared` at synth time. Do NOT use `lambda.Function` with `Code.fromAsset()` — that requires pre-built artifacts and breaks CI/CD.
+- Configure `NodejsFunction` bundling to only externalize AWS SDK: `bundling: { externalModules: ['@aws-sdk/*'] }`. All other dependencies (zod, etc.) must be bundled by esbuild, not externalized. Avoid npm packages that aren't needed — prefer Node.js built-ins (e.g., `crypto.randomUUID()` instead of `uuid`).
 - Follow least-privilege IAM patterns
 - Write CDK tests (snapshot + fine-grained assertions)
 - Run `cdk synth` to validate templates locally before committing
