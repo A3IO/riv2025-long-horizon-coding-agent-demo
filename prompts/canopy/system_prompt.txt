@@ -137,6 +137,7 @@ CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda func
 
 ## Infrastructure as Code
 - Write CDK stacks in TypeScript using aws-cdk-lib v2
+- **Use `NodejsFunction` from `aws-cdk-lib/aws-lambda-nodejs`** for Lambda handlers — it bundles with esbuild automatically, resolving imports from `@canopy/shared` at synth time. Do NOT use `lambda.Function` with `Code.fromAsset()` — that requires pre-built artifacts and breaks CI/CD.
 - Follow least-privilege IAM patterns
 - Write CDK tests (snapshot + fine-grained assertions)
 - Run `cdk synth` to validate templates locally before committing
@@ -162,7 +163,8 @@ Follow this strict implementation order. Do NOT skip ahead — each phase depend
 - Write all Zod schemas in `shared/schemas/`
 - Export inferred types from `shared/types.ts`
 - Define the endpoint route map in `shared/endpoints.ts`
-- Verify compilation: `cd shared && npx tsc --noEmit`
+- Ensure `shared/package.json` has `"build": "tsc"` script and a `tsconfig.json` that emits to `dist/`
+- Verify compilation: `cd shared && npm run build`
 - Commit: "feat: add shared API contract with Zod schemas"
 
 ### Phase 2a: Infrastructure (CDK)
