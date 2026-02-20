@@ -162,19 +162,6 @@ jobs:
           fi
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
 
-      - name: Build shared package
-        if: steps.check.outputs.exists == 'true'
-        working-directory: ${{ steps.check.outputs.app_dir }}
-        run: |
-          if [ -f "shared/package.json" ]; then
-            echo "Building shared package..."
-            cd shared
-            if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
-            npm run build
-          else
-            echo "No shared package found, skipping"
-          fi
-
       - name: Build application
         if: steps.check.outputs.exists == 'true'
         working-directory: ${{ steps.check.outputs.app_dir }}
