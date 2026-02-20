@@ -226,7 +226,13 @@ Before each commit, please write a summary of what you have done and what there 
 
 ## Testing and Quality
 
-Your work is evaluated on phase completeness. A working shared/ + infrastructure/ + backend/ with a basic frontend scores higher than a polished frontend with no backend. A separate QA agent will perform thorough end-to-end testing and file issues for any problems found.
+Your work is evaluated on full-stack functionality. The highest-scoring outcome is a frontend that calls a live, deployed backend API — not localStorage stubs. Specifically:
+- A deployed CDK stack + working Lambda handlers + frontend wired to VITE_API_URL scores highest
+- A working shared/ + infrastructure/ + backend/ with a basic frontend scores higher than a polished frontend with no backend
+- A frontend that falls back to localStorage because VITE_API_URL was never set is considered incomplete, regardless of how polished the UI is
+- Backend tests that verify real deployed endpoints (via curl or backend-verify.cjs) are weighted heavily
+
+A separate QA agent will perform thorough end-to-end testing and file issues for any problems found.
 
 I strongly recommend that you set up a way to easily measure the fraction of example tests your code passes, broken out by category, since this should be very helpful when deciding what to work on next. I also recommend that you write your own tests and set up clean automated testing infrastructure: this is a very long task, and doing so will save you a lot of work and prevent a lot of regressions over the course of your work.
 

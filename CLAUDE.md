@@ -30,23 +30,29 @@ The end-to-end pipeline is fully operational:
 
 **Result (issue #22):** 54/54 tests passing — 3 shared, 7 infrastructure, 6 backend, 38 frontend. 18 tests use backend-verify.cjs, 36 use playwright variants. Build order correct: shared → infra → backend → frontend.
 
-### Remaining Issues
+### Prompt Update: CDK-First Deployment Flow (commit `3744400`)
 
-#### Frontend not connected to deployed backend
-The agent builds a working frontend with a good API client architecture (tryApi with localStorage fallback), but `VITE_API_URL` is never set. The frontend defaults to localStorage for all data. The agent never checks SSM deploy-state for the API URL and never creates `frontend/.env`.
+The previous agent runs (issues #17, #22) showed the agent writing CDK infrastructure and backend Lambda handlers simultaneously, never waiting for CI/CD deployment, and never wiring `VITE_API_URL` into the frontend. Three problems:
+1. Frontend defaulted to localStorage because `VITE_API_URL` was never set
+2. Agent never polled SSM deploy-state — zero CloudWatch log entries for "deploy", "ssm", "apiUrl"
+3. deploy-infrastructure workflow failed 3 times due to missing build steps (**fixed in `4a8867c`**)
 
-#### CI/CD deploy-infrastructure failed 3 times
-The deploy-infrastructure workflow triggered on 3 commits but failed every time at `npm test` with "Cannot find asset at generated-app/backend/dist". The workflow was missing build steps for shared/ and backend/. **Fixed in commit `4a8867c`** — added shared + backend build steps before CDK tests.
+**Fix applied (commit `3744400`):** Updated prompts in `prompts/system_prompt.txt`, `prompts/canopy/system_prompt.txt`, and `claude_code.py` to enforce a CDK-first deployment flow:
+- Split old "Phase 2: Infrastructure + Backend" into **Phase 2a** (CDK + stub handlers, commit and push) and **Phase 2b** (poll SSM deploy-state until succeeded, then implement full handlers)
+- Phase 3 now explicitly wires `VITE_API_URL` by reading the API URL from SSM deploy-state and creating `frontend/.env`
+- `claude_code.py` initial message now says "WAIT for CI/CD deployment" and "Do NOT proceed until status=succeeded"
+- `claude_code.py` continuation message simplified to check deploy-state and wire `VITE_API_URL` if missing
+- Added `--region us-east-1` to all SSM commands (was missing before)
 
-#### Agent unaware of CI/CD pipeline
-CloudWatch log search for "deploy", "workflow", "CI", "deploy-state", "ssm", "apiUrl", "VITE_API" returned zero events. The agent has no feedback loop from GitHub Actions and never checks whether its infrastructure was deployed.
+**Status: NOT YET TESTED.** These prompt changes need a live agent run to verify the agent actually follows the wait-then-wire flow. Next step is to rebuild the Docker image, push to ECR, and trigger a new issue.
 
-#### Next: Agent should use deployed CDK resources
-The agent writes CDK infrastructure and backend Lambda handlers in the same phase, but the backend code isn't actually deployed or connected. The prompts need to instruct the agent to:
-1. Commit CDK infrastructure separately and wait for CI/CD to deploy it
-2. Check SSM deploy-state to confirm deployment succeeded and get the API URL
-3. Write backend handlers that reference the deployed resources
-4. Wire `VITE_API_URL` into the frontend so it uses the real API
+### Next: Live Test of CDK-First Flow
+
+To validate the prompt changes from `3744400`:
+1. Rebuild and push Docker image (prompts are baked in)
+2. `make update-runtime-env` and `make reset`
+3. Trigger a new issue and monitor CloudWatch for SSM polling activity
+4. Verify the agent: commits CDK + stubs first, polls deploy-state, writes full handlers after deployment succeeds, and creates `frontend/.env` with `VITE_API_URL`
 
 ### Previous Fixes (for reference)
 
