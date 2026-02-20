@@ -85,14 +85,21 @@ jobs:
       - name: Install CDK dependencies
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
-        run: npm ci
+        run: |
+          if [ -f "package-lock.json" ]; then
+            npm ci
+          else
+            npm install
+          fi
 
       - name: Build shared package
         if: steps.check.outputs.exists == 'true'
         run: |
           if [ -f "generated-app/shared/package.json" ]; then
             echo "Building shared package..."
-            cd generated-app/shared && npm ci && npm run build
+            cd generated-app/shared
+            if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+            npm run build
           else
             echo "No shared package found, skipping"
           fi
@@ -102,7 +109,9 @@ jobs:
         run: |
           if [ -f "generated-app/backend/package.json" ]; then
             echo "Building backend..."
-            cd generated-app/backend && npm ci && npm run build
+            cd generated-app/backend
+            if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+            npm run build
           else
             echo "No backend package found, skipping"
           fi

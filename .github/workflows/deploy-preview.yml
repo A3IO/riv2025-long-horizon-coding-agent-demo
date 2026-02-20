@@ -162,12 +162,37 @@ jobs:
           fi
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
 
+      - name: Build shared package
+        if: steps.check.outputs.exists == 'true'
+        working-directory: ${{ steps.check.outputs.app_dir }}
+        run: |
+          if [ -f "shared/package.json" ]; then
+            echo "Building shared package..."
+            cd shared
+            if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+            npm run build
+          else
+            echo "No shared package found, skipping"
+          fi
+
       - name: Build application
         if: steps.check.outputs.exists == 'true'
         working-directory: ${{ steps.check.outputs.app_dir }}
         env:
           VITE_API_URL: ${{ steps.api-url.outputs.api_url }}
-        run: npm run build
+        run: |
+          # Try root-level build first (handles both flat and monorepo layouts)
+          if npm run build 2>&1; then
+            echo "Root-level build succeeded"
+          elif [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
+            echo "Root-level build failed, trying frontend/ directly..."
+            cd frontend
+            if [ -f "package-lock.json" ]; then npm ci; else npm install; fi
+            npm run build
+          else
+            echo "ERROR: Build failed and no frontend/ workspace found"
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         if: steps.check.outputs.exists == 'true'
