@@ -99,20 +99,20 @@ jobs:
         working-directory: generated-app/infrastructure
         run: |
           if [ -f "package-lock.json" ]; then
-            npm ci
+            npm ci 2>&1 | tee -a /tmp/infra-build.log
           else
-            npm install
+            npm install 2>&1 | tee -a /tmp/infra-build.log
           fi
 
       - name: Run CDK tests
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
-        run: npm test
+        run: npm test 2>&1 | tee -a /tmp/infra-build.log
 
       - name: CDK Synth (validate template)
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
-        run: npx cdk synth
+        run: npx cdk synth 2>&1 | tee -a /tmp/infra-build.log
 
       - name: CDK Diff
         if: steps.check.outputs.exists == 'true'
@@ -154,7 +154,7 @@ jobs:
         id: deploy
         working-directory: generated-app/infrastructure
         run: |
-          npx cdk deploy --require-approval never --outputs-file /tmp/cdk-outputs.json 2>&1
+          npx cdk deploy --require-approval never --outputs-file /tmp/cdk-outputs.json 2>&1 | tee -a /tmp/infra-build.log
           API_URL=$(jq -r '.[].ApiUrl // empty' /tmp/cdk-outputs.json)
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
 
@@ -184,8 +184,19 @@ jobs:
         if: failure() && steps.check.outputs.exists == 'true'
         run: |
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          STATE=$(jq -nc --arg s "failed" --arg c "${{ github.sha }}" --arg t "$TIMESTAMP" \
-            '{status:$s,commit:$c,timestamp:$t,apiUrl:""}')
+
+          # Grab last 40 lines of build log, truncate to fit SSM 4KB limit
+          ERROR_LOG=""
+          if [ -f /tmp/infra-build.log ]; then
+            ERROR_LOG=$(tail -40 /tmp/infra-build.log | head -c 3000)
+          fi
+
+          STATE=$(jq -nc \
+            --arg s "failed" \
+            --arg c "${{ github.sha }}" \
+            --arg t "$TIMESTAMP" \
+            --arg e "$ERROR_LOG" \
+            '{status:$s,commit:$c,timestamp:$t,apiUrl:"",error:$e}')
 
           aws ssm put-parameter --name "/claude-code/infra/deploy-state" \
             --value "$STATE" --type String --overwrite

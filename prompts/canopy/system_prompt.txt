@@ -182,7 +182,7 @@ After committing infrastructure, **wait for CI/CD to deploy the CDK stack**. Che
 ```bash
 aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text
 ```
-This returns JSON with `status` ("deploying", "succeeded", or "failed") and `apiUrl`. Keep polling every 30-60 seconds until `status` is `"succeeded"`. If it fails, check the GitHub Actions run for error details.
+This returns JSON with `status` ("deploying", "succeeded", or "failed"), `apiUrl`, and on failure an `error` field with the build/deploy log output. Keep polling every 30-60 seconds until `status` is `"succeeded"`. If `status` is `"failed"`, read the `error` field to understand what went wrong, fix the issue in your code, commit, and push again to re-trigger the deployment.
 
 Once deployed:
 1. Extract the API URL from the deploy-state: `API_URL=$(aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text | jq -r '.apiUrl')`
