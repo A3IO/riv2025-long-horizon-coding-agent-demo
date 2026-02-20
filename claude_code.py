@@ -1198,35 +1198,32 @@ CRITICAL PORT CONFIGURATION:
 
 INFRASTRUCTURE SETUP (for full-stack projects):
 If the BUILD_PLAN specifies a full-stack architecture with infrastructure/:
-1. Set up the monorepo structure FIRST: frontend/, backend/, infrastructure/
-2. Write the CDK stack early (infrastructure/lib/) — it defines DynamoDB, Lambda, API Gateway
-3. Write CDK tests (infrastructure/test/) — snapshot + assertion tests
-4. Run `npx cdk synth` to validate the template compiles (NEVER run `cdk deploy`)
-5. Write Lambda handlers in backend/src/handlers/
-6. Create the API client layer in frontend/src/api/
-7. Commit and PUSH the infrastructure code early — CI/CD will deploy it asynchronously
-8. Continue working on backend handlers and frontend while infrastructure deploys
-9. NEVER run `cdk deploy` yourself — deployment happens via CI/CD only
+1. Set up the monorepo structure FIRST: shared/, backend/, infrastructure/, frontend/
+2. Complete Phase 1 (shared contract) and commit
+3. Write the CDK stack (infrastructure/lib/) — DynamoDB, Lambda, API Gateway
+4. Write CDK tests (infrastructure/test/) — snapshot + assertion tests
+5. Write **stub Lambda handlers** in backend/src/handlers/ — minimal handlers that compile but return placeholder responses. CDK needs these to bundle.
+6. Run `npx cdk synth` to validate the template compiles (NEVER run `cdk deploy`)
+7. Commit and PUSH the infrastructure + stub handlers — CI/CD will deploy the stack automatically
+8. **WAIT for CI/CD deployment to succeed** before writing full backend handlers or frontend API calls. Poll SSM deploy-state until status is "succeeded".
+9. Once deployed, implement the full Lambda handlers (replacing stubs), then wire the frontend to the API URL
+10. NEVER run `cdk deploy` yourself — deployment happens via CI/CD only
 
-INFRASTRUCTURE DEPLOYMENT IS ASYNC:
-After you push infrastructure code, CI/CD deploys it in the background.
-Deployment state is stored as a single atomic JSON object in SSM.
-To check deployment state, run:
-  `aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text`
+INFRASTRUCTURE DEPLOYMENT — WAIT FOR IT:
+After you push infrastructure code, CI/CD deploys it automatically (deploy-infrastructure.yml).
+You MUST wait for deployment to succeed before implementing backend handlers or frontend API calls.
+Deployment state is stored in SSM. Poll it:
+  STATUS=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --region us-east-1 --query Parameter.Value --output text | jq -r '.status')
+  API_URL=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --region us-east-1 --query Parameter.Value --output text | jq -r '.apiUrl')
 
-This returns a JSON object like: {{"status":"succeeded","commit":"abc123","timestamp":"2025-...","apiUrl":"https://..."}}
-Parse with jq:
-  STATUS=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.status')
-  API_URL=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.apiUrl')
-  DEPLOY_COMMIT=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.commit')
-
-  - status="deploying" → deployment is in progress. Keep working on other tasks and check again later.
-  - status="succeeded" → infrastructure is live! Use the apiUrl field to verify: `curl -s $API_URL/projects`
+  - status="deploying" → deployment is in progress. Poll again in 30-60 seconds.
+  - status="succeeded" → infrastructure is live! Use the apiUrl to verify: `curl -s $API_URL/projects`
   - status="failed" → deployment failed. Check your CDK code for errors, fix, commit, and push again.
   - ParameterNotFound → no deployment has been attempted yet. Push your infrastructure code first.
 
-After verifying the API is live, record the deploy commit in claude-progress.txt as "last verified deploy commit: <sha>".
-This lets you detect when infrastructure has been redeployed (see continuation session instructions).
+**Do NOT proceed to write full backend handlers or frontend API client until status="succeeded" and you have the API URL.**
+
+After verifying the API is live, record the deploy commit and API URL in claude-progress.txt.
 
 """
             message += """
@@ -1366,17 +1363,12 @@ If the project has an infrastructure/ directory:
    API_URL=$(echo "$DEPLOY_STATE" | jq -r '.apiUrl')
    ```
 
-   - status="succeeded" → Infrastructure is deployed. Now check for CHANGES:
-     a. Read claude-progress.txt for "last verified deploy commit: <sha>"
-     b. **If DEPLOY_COMMIT DIFFERS from your last verified commit** (or you have no record):
-        Infrastructure has been redeployed since your last verification.
-        You MUST rerun E2E tests to check for regressions:
-        - Verify API is reachable: `curl -s $API_URL/projects`
-        - Run all API E2E tests
-        - If regressions found, fix the backend/infrastructure code, commit, and push
-        - Update claude-progress.txt with the new "last verified deploy commit: <sha>"
-     c. If deploy commit matches your last verified commit, infra hasn't changed — skip E2E re-verification
-   - status="deploying" → Deployment in progress. Continue other work and check again later.
+   - status="succeeded" → Infrastructure is deployed. Now:
+     a. Verify API is reachable: `curl -s $API_URL/projects`
+     b. If you haven't written full Lambda handlers yet (only stubs), NOW implement them
+     c. If frontend/.env doesn't have VITE_API_URL, create it and restart dev server
+     d. Update claude-progress.txt with API URL and deploy commit
+   - status="deploying" → Deployment in progress. Poll again in 30-60 seconds. Do NOT write full backend handlers or frontend API calls until this succeeds.
    - status="failed" → Deployment failed. Check CDK code for errors, fix, commit, push.
    - ParameterNotFound → No deployment attempted yet. Push infrastructure code if not done.
 

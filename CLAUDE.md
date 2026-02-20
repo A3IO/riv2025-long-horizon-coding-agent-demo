@@ -2,7 +2,7 @@
 
 This file provides context for Claude Code sessions working on this repository.
 
-## Current State (2026-02-19)
+## Current State (2026-02-20)
 
 ### What's Working
 
@@ -11,58 +11,48 @@ The end-to-end pipeline is fully operational:
 - AgentCore container starts, clones repo, runs Claude SDK against Bedrock
 - Agent generates code, commits to `agent-runtime` branch, pushes via post-commit hook
 - deploy-preview workflow builds the app and deploys to CloudFront
+- deploy-infrastructure workflow builds shared/backend, runs CDK tests, and deploys the stack
 - Agent subprocess output is visible in CloudWatch via Python logging/OTEL
 
-### Phase Ordering Fix (issue #17)
+### Issue #22 — Backend Test Verification Fix (SUCCESS)
 
-The agent previously ignored the phased execution plan (shared/ → backend/ → frontend/). On issue #14, it built a **frontend-only** React app with Dexie/IndexedDB local storage instead of the full-stack monorepo.
+**The problem (issue #17):** Despite building the backend correctly (shared → infra → backend → frontend), all 220 tests were frontend-only. Zero shared/infrastructure/backend tests.
 
-**Root cause:** The system prompt incentivized UI quality ("graded on quality of GUI", "pixel-perfect") and demanded 200+ tests upfront, causing the agent to rationally build a testable frontend-only app.
+**Root cause:** A hardcoded screenshot gate in `src/security.py` prevented marking ANY test as passing without a Playwright screenshot + console file. Since there was no verification path for backend tests, the agent rationally wrote only frontend tests.
 
-**Fix applied (commit `8dfdae7`):**
-- Replaced grading language with phase-completion incentives ("working shared/ + infrastructure/ + backend/ scores higher than polished frontend with no backend")
-- Reduced test count from 200 to ~50, weighted toward backend/infra categories (shared, infrastructure, backend, then frontend)
-- Added Phased Execution section to canopy-specific system prompt (was only in top-level)
-- Added `@canopy/shared` import requirements to canopy Backend Development section
-- Replaced "all tests must pass" completion gates with phase gates (shared compiles, infra synths, backend builds, frontend builds)
-- Simplified test verification (removed "SYSTEM WILL BLOCK YOUR EDIT" enforcement language)
-- Softened continuation message (removed one-line-at-a-time test enforcement, reduced verification paranoia)
+**Fix applied (commits on `kb/improved-harness`):**
+- Created `frontend-scaffold-template/backend-verify.cjs` — runs shell commands and produces `-result.txt` + `-console.txt` artifacts
+- Added alternative verification path in `src/security.py` — accepts `-result.txt` with `VERIFIED_BY: backend-verify.cjs` sentinel instead of requiring screenshots
+- Added AWS data-plane commands to security allowlist (DynamoDB scan/query, CloudWatch logs, Lambda invoke)
+- Added IAM permissions in CDK stack (`AgentCoreBackendTestPolicy`) for canopy-* scoped resources
+- Updated prompts with backend-verify.cjs examples for all categories
+- Updated `claude_code.py` initial + continuation messages with category-specific verification guidance
 
-**Result (issue #17):** Agent's first commit was `feat: add shared API contract, CDK infrastructure, and Lambda handlers` — it built shared/ + infra + backend before touching frontend. Two sessions, 10 commits, live preview deployed.
+**Result (issue #22):** 54/54 tests passing — 3 shared, 7 infrastructure, 6 backend, 38 frontend. 18 tests use backend-verify.cjs, 36 use playwright variants. Build order correct: shared → infra → backend → frontend.
 
-### Next Investigation: Why are tests still 100% frontend?
+### Remaining Issues
 
-**The problem:** Despite the prompt asking for ~50 tests with the first ~20 covering shared/infra/backend, the agent wrote 220 tests that are ALL frontend UI tests. Zero `shared`, `infrastructure`, or `backend` category tests. The phase ordering fix worked (it built the backend first), but the test composition is still entirely UI-biased.
+#### Frontend not connected to deployed backend
+The agent builds a working frontend with a good API client architecture (tryApi with localStorage fallback), but `VITE_API_URL` is never set. The frontend defaults to localStorage for all data. The agent never checks SSM deploy-state for the API URL and never creates `frontend/.env`.
 
-**Hypothesis:** The bias may not come from the system prompt alone. There may be something else in the pipeline that prepopulates or biases toward frontend tests. Investigate these in order:
+#### CI/CD deploy-infrastructure failed 3 times
+The deploy-infrastructure workflow triggered on 3 commits but failed every time at `npm test` with "Cannot find asset at generated-app/backend/dist". The workflow was missing build steps for shared/ and backend/. **Fixed in commit `4a8867c`** — added shared + backend build steps before CDK tests.
 
-1. **`frontend-scaffold-template/`** — This template is copied into `generated-app/` before the agent starts. Check if it includes a `tests.json` or any test scaffolding that's frontend-only. If the agent sees existing frontend test patterns, it will follow them.
-   - Look at: `frontend-scaffold-template/` directory contents (already in the repo)
-   - Key question: Does the template include any `tests.json`, `playwright-test.cjs`, or example test files?
+#### Agent unaware of CI/CD pipeline
+CloudWatch log search for "deploy", "workflow", "CI", "deploy-state", "ssm", "apiUrl", "VITE_API" returned zero events. The agent has no feedback loop from GitHub Actions and never checks whether its infrastructure was deployed.
 
-2. **`prompts/canopy/EXAMPLE_TEST.txt`** — This file is loaded by `load_example_test()` in `claude_code.py:70-95` and injected into the continuation message. If it only shows frontend test examples, the agent learns that pattern.
-   - Look at: `prompts/canopy/EXAMPLE_TEST.txt` (if it exists)
-   - Also check: `prompts/EXAMPLE_TEST.txt` (top-level fallback)
+#### Next: Agent should use deployed CDK resources
+The agent writes CDK infrastructure and backend Lambda handlers in the same phase, but the backend code isn't actually deployed or connected. The prompts need to instruct the agent to:
+1. Commit CDK infrastructure separately and wait for CI/CD to deploy it
+2. Check SSM deploy-state to confirm deployment succeeded and get the API URL
+3. Write backend handlers that reference the deployed resources
+4. Wire `VITE_API_URL` into the frontend so it uses the real API
 
-3. **`prompt_template.txt`** — Loaded in `create_thyme_style_message()` at `claude_code.py:475`. This is injected into every initial message. May contain test-related instructions.
-   - Look at: `prompt_template.txt` in the repo root
+### Previous Fixes (for reference)
 
-4. **`claude_code.py` initial message (lines 1232-1327)** — The test format examples we changed show `shared`, `infrastructure`, `backend`, `functional`, `style` categories. But check if the agent is actually seeing these examples or if something else overwrites them. The `create_thyme_style_message()` call at line 1192 builds the base message from BUILD_PLAN, then lines 1232+ append the test instructions. Verify the final assembled message includes the backend test examples.
+**Phase ordering (issue #17, commit `8dfdae7`):** Replaced grading language with phase-completion incentives. Agent went from building frontend-only to building shared → infra → backend → frontend correctly.
 
-5. **`prompts/canopy/BUILD_PLAN.md`** — The build plan itself may describe features in a way that only suggests frontend tests. If the test section of the build plan lists UI acceptance criteria but no backend test criteria, the agent will write UI tests.
-   - Look at: `prompts/canopy/BUILD_PLAN.md` — search for any test-related sections
-
-6. **The `playwright-test.cjs` helper** — The test verification workflow is entirely screenshot-based (take screenshot, view it, mark passing). This workflow only makes sense for frontend tests. There's no equivalent "run this backend test and verify" workflow described. The agent may be writing only tests it knows how to verify.
-   - Consider: Should we add a backend test verification workflow? e.g., `cd backend && npm test` or `cd shared && npx tsc --noEmit` as verifiable test steps?
-
-**Other remaining issues:**
-- All 220 tests are marked `"passes": false` in the final tests.json despite the progress file claiming they all pass — the batch-marking commit may have had issues
-- A separate QA agent is planned to handle thorough end-to-end testing
-
-**Files changed in the last session (commit `8dfdae7` on `kb/improved-harness`):**
-- `prompts/system_prompt.txt` — Testing/Quality, Test Verification, Signaling Completion sections
-- `prompts/canopy/system_prompt.txt` — Same + added Phased Execution section + @canopy/shared imports
-- `claude_code.py` — Initial message (lines ~1232-1327) and continuation message (line ~1416)
+**IAM role mismatch (issue #20-21):** CDK deployed policies to wrong IAM role (`AmazonBedrockAgentCoreSDKRuntime-*` instead of `claude-code-agentcore-role`). Container silently crashed. Fixed by adding `AGENTCORE_ROLE_NAME` and `VPC_ID` as Makefile defaults for `deploy-infra`.
 
 ### Key Config
 

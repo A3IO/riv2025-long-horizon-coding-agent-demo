@@ -156,7 +156,7 @@ CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda func
 
 ## Phased Execution
 
-Follow this strict implementation order. Do NOT skip ahead to frontend UI before the contract and backend are in place.
+Follow this strict implementation order. Do NOT skip ahead — each phase depends on the previous one being committed and (for infrastructure) deployed via CI/CD.
 
 ### Phase 1: Shared Contract (DO FIRST)
 - Write all Zod schemas in `shared/schemas/`
@@ -165,25 +165,47 @@ Follow this strict implementation order. Do NOT skip ahead to frontend UI before
 - Verify compilation: `cd shared && npx tsc --noEmit`
 - Commit: "feat: add shared API contract with Zod schemas"
 
-### Phase 2: Infrastructure + Backend
-- Write CDK stack (DynamoDB, Lambda, API GW, S3/CloudFront)
+### Phase 2a: Infrastructure (CDK)
+- Write CDK stack (DynamoDB, Lambda, API GW, S3/CloudFront) referencing `canopy-` prefixed resources
 - Write CDK tests (snapshot + assertions)
-- Write Lambda handlers that import from `@canopy/shared` for validation
-- Each handler validates input with Zod `.parse()`, returns typed responses
-- Commit after CDK, commit after handlers
+- Write **stub Lambda handlers** — minimal handlers that import from `@canopy/shared`, validate input, and return placeholder responses. These stubs must compile so CDK can bundle them.
+- Verify: `cd infrastructure && npx cdk synth` and `cd infrastructure && npm test`
+- **Commit and push immediately**: "feat: add CDK infrastructure with stub handlers"
+- CI/CD will automatically deploy the stack (deploy-infrastructure.yml triggers on push to agent-runtime when infrastructure/ changes)
 
-### Phase 3: Frontend
+### Phase 2b: Wait for deployment, then implement backend
+After committing infrastructure, **wait for CI/CD to deploy the CDK stack**. Check SSM for deployment status:
+```bash
+aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text
+```
+This returns JSON with `status` ("deploying", "succeeded", or "failed") and `apiUrl`. Keep polling every 30-60 seconds until `status` is `"succeeded"`. If it fails, check the GitHub Actions run for error details.
+
+Once deployed:
+1. Extract the API URL from the deploy-state: `API_URL=$(aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text | jq -r '.apiUrl')`
+2. Write the full Lambda handler implementations (replacing stubs) that import from `@canopy/shared` for validation
+3. Each handler validates input with Zod `.parse()`, returns typed responses
+4. Verify the deployed endpoints work: `curl -s $API_URL/projects`
+5. Commit: "feat: implement backend Lambda handlers"
+
+### Phase 3: Frontend + API Wiring
+- **Wire VITE_API_URL**: Create `frontend/.env` with the API URL from deploy-state:
+  ```bash
+  API_URL=$(aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text | jq -r '.apiUrl')
+  echo "VITE_API_URL=$API_URL" > frontend/.env
+  ```
+- Restart the dev server after creating `.env` so Vite picks up the new env var
 - Build API client layer importing types from `@canopy/shared`
+- The API client should call the real backend via `VITE_API_URL`, with localStorage as fallback only when the API is unreachable
 - Build React Query hooks wrapping the API client
 - Build UI components consuming the hooks
 - Frontend MUST use the shared types — no duplicate type definitions
 
 ### Phase 4: Integration + Polish
-- E2E tests against the running frontend
+- E2E tests against the running frontend (should hit real API now)
 - Dark theme, animations, keyboard shortcuts
 - Performance optimization, final polish
 
-CRITICAL: If you find yourself writing frontend components before Phase 1 is committed, STOP and go back to the contract.
+CRITICAL: If you find yourself writing frontend components before Phase 1 is committed, STOP and go back to the contract. If you find yourself writing frontend API calls before Phase 2b confirms a successful deployment, STOP and check deploy-state first.
 
 ## Core Instructions
 
