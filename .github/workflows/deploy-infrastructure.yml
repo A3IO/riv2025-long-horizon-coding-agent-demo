@@ -155,7 +155,11 @@ jobs:
         working-directory: generated-app/infrastructure
         run: |
           npx cdk deploy --require-approval never --outputs-file /tmp/cdk-outputs.json 2>&1 | tee -a /tmp/infra-build.log
-          API_URL=$(jq -r '.[].ApiUrl // empty' /tmp/cdk-outputs.json)
+          if [ -f /tmp/cdk-outputs.json ]; then
+            API_URL=$(jq -r '.[].ApiUrl // empty' /tmp/cdk-outputs.json)
+          else
+            API_URL=""
+          fi
           echo "api_url=$API_URL" >> $GITHUB_OUTPUT
 
       - name: Signal deploy succeeded
