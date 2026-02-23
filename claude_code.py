@@ -1853,13 +1853,14 @@ async def main() -> None:
                     shutil.copy2(item, dest)
             builtins.print(f"📂 Cloned template to {generation_dir}")
 
-        # Setup prompts
-        SessionManager.setup_session_prompts(
-            generation_dir,
-            prompts_dir,
-            template_vars,
-            bootstrap_files=args.bootstrap_files,
-        )
+    # Always setup prompts (even for existing projects — prompts come from the
+    # Docker image and must be refreshed so enhancement mode has them available)
+    SessionManager.setup_session_prompts(
+        generation_dir,
+        prompts_dir,
+        template_vars,
+        bootstrap_files=args.bootstrap_files if not is_existing_project else False,
+    )
 
     # Validate cleanup-session requires existing project
     if args.cleanup_session and not is_existing_project:

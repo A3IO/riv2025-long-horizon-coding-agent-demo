@@ -1708,19 +1708,20 @@ def run_agent_background(
         # GitHub mode - work in the cloned repo directory
         cwd = str(build_dir)
 
+        project_name = os.environ.get("PROJECT_NAME", "canopy")
+
         if is_enhancement and feature_request_path:
             # Enhancement mode - enhance existing generated-app/
             cmd = [
                 "python", "/app/claude_code.py",
                 "--enhance-feature", str(feature_request_path),
                 "--existing-codebase", str(build_dir / "generated-app"),
+                "--project", project_name,
                 "--model", model,
                 "--skip-git-init"  # Don't create nested .git - use cloned repo's git
             ]
         else:
             # Full build mode - build from scratch using BUILD_PLAN
-            # Use PROJECT_NAME env var if set, otherwise default to canopy
-            project_name = os.environ.get("PROJECT_NAME", "canopy")
             cmd = [
                 "python", "/app/claude_code.py",
                 "--project", project_name,
@@ -1728,7 +1729,7 @@ def run_agent_background(
                 "--output-dir", str(build_dir / "generated-app"),
                 "--skip-git-init"  # Don't create nested .git - use cloned repo's git
             ]
-            logger.info(f"Using project: {project_name}")
+        logger.info(f"Using project: {project_name}")
 
         logger.info(f"GitHub mode: {'enhancement' if is_enhancement else 'full build'}")
     else:
