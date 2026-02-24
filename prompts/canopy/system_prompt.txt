@@ -148,23 +148,6 @@ CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda func
 - Stack outputs must include: ApiUrl, FrontendBucketName, DistributionId
 - Use CfnOutput for all values that other systems need
 
-### Required CDK Construct IDs (DO NOT CHANGE)
-A CloudFormation stack (`canopy-app-stack`) already exists from a previous deployment. You MUST use these exact construct IDs so CDK generates matching logical IDs and updates the existing stack instead of trying to create duplicate resources. Changing any construct ID will cause "already exists" errors during deployment.
-
-| Resource | Stack ID | Construct ID | Physical Name |
-|----------|----------|-------------|---------------|
-| DynamoDB Table | `canopy-app-stack` | `CanopyMainTable` | `canopy-main-table` |
-| Lambda Function | | `CanopyApiHandler` | `canopy-api-handler` |
-| HTTP API | | `CanopyHttpApi` | `canopy-api` |
-| Lambda Integration | | `CanopyLambdaIntegration` | (auto) |
-| S3 Bucket | | `CanopyFrontendBucket` | `canopy-frontend-{account}-{region}` |
-| CloudFront Distribution | | `CanopyDistribution` | (auto) |
-| Origin Access Identity | | `OAI` | (auto) |
-
-**CDK app entry point** (`bin/canopy.ts`): `new CanopyStack(app, 'canopy-app-stack', ...)`
-
-**API Gateway routes**: Use separate per-method routes (`GET`, `POST`, `PUT`, `DELETE` on `/{proxy+}`) plus a `GET` on `/`. Do NOT use `ANY /{proxy+}` — the existing stack has per-method routes and switching to ANY changes the logical IDs, causing deployment conflicts.
-
 ## Infrastructure Testing
 - Write snapshot tests to catch unintended changes
 - Write assertion tests to validate:
