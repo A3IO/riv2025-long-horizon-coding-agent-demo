@@ -98,6 +98,7 @@ jobs:
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
         run: |
+          set -o pipefail
           if [ -f "package-lock.json" ]; then
             npm ci 2>&1 | tee -a /tmp/infra-build.log
           else
@@ -107,12 +108,16 @@ jobs:
       - name: Run CDK tests
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
-        run: npm test 2>&1 | tee -a /tmp/infra-build.log
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee -a /tmp/infra-build.log
 
       - name: CDK Synth (validate template)
         if: steps.check.outputs.exists == 'true'
         working-directory: generated-app/infrastructure
-        run: npx cdk synth 2>&1 | tee -a /tmp/infra-build.log
+        run: |
+          set -o pipefail
+          npx cdk synth 2>&1 | tee -a /tmp/infra-build.log
 
       - name: CDK Diff
         if: steps.check.outputs.exists == 'true'
@@ -154,6 +159,7 @@ jobs:
         id: deploy
         working-directory: generated-app/infrastructure
         run: |
+          set -o pipefail
           npx cdk deploy --require-approval never --outputs-file /tmp/cdk-outputs.json 2>&1 | tee -a /tmp/infra-build.log
           if [ -f /tmp/cdk-outputs.json ]; then
             API_URL=$(jq -r '.[].ApiUrl // empty' /tmp/cdk-outputs.json)
