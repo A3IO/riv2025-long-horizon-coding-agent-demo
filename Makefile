@@ -281,36 +281,49 @@ SCREENSHOTS_DISTRIBUTION_ID := $(shell aws cloudformation describe-stacks --stac
 reset:
 	@echo "⚠️  This will wipe all agent state. Press Ctrl+C to abort."
 	@echo ""
-	@echo "1/6 Deleting agent-runtime branch (remote)..."
+	@echo "1/7 Destroying agent's CDK stack (canopy-app-stack)..."
+	@if aws cloudformation describe-stacks --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
+		if [ -d "generated-app/infrastructure" ]; then \
+			cd generated-app/infrastructure && npx cdk destroy --force canopy-app-stack 2>&1 && echo "     Stack destroyed" || echo "     cdk destroy failed, trying cloudformation delete-stack..."; \
+		fi; \
+		if aws cloudformation describe-stacks --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
+			aws cloudformation delete-stack --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) 2>&1 && echo "     delete-stack issued, waiting..." || echo "     delete-stack failed (ok)"; \
+			aws cloudformation wait stack-delete-complete --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Stack deleted" || echo "     Wait timed out (check manually)"; \
+		fi; \
+	else \
+		echo "     canopy-app-stack not found (ok)"; \
+	fi
+	@echo ""
+	@echo "2/7 Deleting agent-runtime branch (remote)..."
 	@gh api -X DELETE repos/$(GITHUB_REPO)/git/refs/heads/agent-runtime 2>/dev/null && echo "     Deleted remote branch" || echo "     Branch not found (ok)"
 	@git branch -D agent-runtime 2>/dev/null && echo "     Deleted local branch" || echo "     Local branch not found (ok)"
 	@echo ""
-	@echo "2/6 Closing all open issues with agent-building label..."
+	@echo "3/7 Closing all open issues with agent-building label..."
 	@for issue in $$(gh issue list --repo $(GITHUB_REPO) --label "agent-building" --state open --json number --jq '.[].number' 2>/dev/null); do \
 		echo "     Closing issue #$$issue..."; \
 		gh issue close $$issue --repo $(GITHUB_REPO) --comment "Closed by make reset" 2>/dev/null || true; \
 	done
 	@echo ""
-	@echo "3/6 Clearing SSM parameters..."
+	@echo "4/7 Clearing SSM parameters..."
 	@aws ssm delete-parameter --name "/claude-code/current-issue" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/current-issue" || echo "     /claude-code/current-issue not found (ok)"
 	@aws ssm delete-parameter --name "/claude-code/session-id" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/session-id" || echo "     /claude-code/session-id not found (ok)"
 	@aws ssm delete-parameter --name "/claude-code/infra/deploy-state" --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Deleted /claude-code/infra/deploy-state" || echo "     /claude-code/infra/deploy-state not found (ok)"
 	@echo ""
-	@echo "4/6 Clearing S3 screenshots bucket..."
+	@echo "5/7 Clearing S3 screenshots bucket..."
 	@if [ -n "$(SCREENSHOT_BUCKET)" ] && [ "$(SCREENSHOT_BUCKET)" != "None" ]; then \
 		aws s3 rm s3://$(SCREENSHOT_BUCKET)/ --recursive --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Screenshots cleared" || echo "     Bucket empty or not found (ok)"; \
 	else \
 		echo "     Screenshot bucket not found (deploy infra first)"; \
 	fi
 	@echo ""
-	@echo "5/6 Clearing S3 previews bucket..."
+	@echo "6/7 Clearing S3 previews bucket..."
 	@if [ -n "$(PREVIEWS_BUCKET)" ] && [ "$(PREVIEWS_BUCKET)" != "None" ]; then \
 		aws s3 rm s3://$(PREVIEWS_BUCKET)/ --recursive --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Previews cleared" || echo "     Bucket empty or not found (ok)"; \
 	else \
 		echo "     Previews bucket not found (deploy infra first)"; \
 	fi
 	@echo ""
-	@echo "6/6 Invalidating CloudFront caches..."
+	@echo "7/7 Invalidating CloudFront caches..."
 	@if [ -n "$(PREVIEWS_DISTRIBUTION_ID)" ] && [ "$(PREVIEWS_DISTRIBUTION_ID)" != "None" ]; then \
 		aws cloudfront create-invalidation --distribution-id $(PREVIEWS_DISTRIBUTION_ID) --paths "/*" --region $(CF_REGION) --profile $(AWS_PROFILE) > /dev/null 2>&1 && echo "     Previews CDN cache invalidated" || echo "     Previews CDN invalidation failed (ok)"; \
 	else \
