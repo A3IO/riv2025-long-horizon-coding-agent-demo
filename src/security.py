@@ -371,6 +371,8 @@ class SecurityValidator:
         if first_word == "aws":
             allowed_aws_patterns = [
                 r"aws\s+cloudformation\s+describe-stacks",
+                r"aws\s+cloudformation\s+describe-stack-events",
+                r"aws\s+cloudformation\s+describe-stack-resources",
                 r"aws\s+cloudformation\s+list-stacks",
                 r"aws\s+apigateway\s+get-rest-apis",
                 r"aws\s+apigatewayv2\s+get-apis",
@@ -387,6 +389,8 @@ class SecurityValidator:
                 r"aws\s+logs\s+describe-log-streams",
                 r"aws\s+sts\s+get-caller-identity",
                 r"aws\s+ssm\s+get-parameter",
+                r"aws\s+ssm\s+get-parameters-by-path",
+                r"aws\s+lambda\s+get-function-url-config",
             ]
             if not any(re.match(pat, command) for pat in allowed_aws_patterns):
                 print(f"🚨 BLOCKED: {command}")
