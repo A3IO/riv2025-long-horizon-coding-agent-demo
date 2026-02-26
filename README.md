@@ -81,6 +81,8 @@ Where `{env}` is the environment name (default: `reinvent`).
 
 ## Creating a New Project
 
+> **Recommended**: Run `claude` in this repo for an interactive guided setup. Claude will check your prerequisites, help you create a BUILD_PLAN.md, deploy infrastructure, and trigger the agent — all conversationally.
+
 The agent uses `PROJECT_NAME` to find build plans and configure each project. To build something other than the default Canopy app:
 
 ### 1. Create a build plan directory

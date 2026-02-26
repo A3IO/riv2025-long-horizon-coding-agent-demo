@@ -2,7 +2,74 @@
 
 This file provides context for Claude Code sessions working on this repository.
 
-## Current State (2026-02-20)
+## Getting Started with Claude Code
+
+**When to activate**: If the user's first message is a greeting ("hi", "hello"), "help", "get started", "setup", "how do I use this", or otherwise doesn't specify a concrete task — run this onboarding flow. If the user comes with a specific task, skip this section entirely.
+
+### Step 1: Check Prerequisites
+
+Run quick version checks and report which tools are ready:
+
+```bash
+aws --version        # AWS CLI v2
+docker --version     # Docker
+cdk --version        # AWS CDK
+gh --version         # GitHub CLI
+node --version       # Node.js 18+
+```
+
+If any are missing, tell the user what to install before continuing.
+
+### Step 2: Choose a Path
+
+Ask the user: **"Would you like to deploy the Canopy demo app, or create a new project?"**
+
+---
+
+#### Path A: Deploy Canopy
+
+Walk the user through these steps interactively, running commands and explaining output:
+
+1. **Deploy infrastructure**: `make deploy-infra`
+2. **Build and push Docker image**:
+   - `make show-config` to get the ECR URI
+   - `aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ECR_URI>`
+   - `docker build --platform linux/arm64 -t <ECR_URI>:latest .`
+   - `docker push <ECR_URI>:latest`
+3. **Update runtime**: `make update-runtime-env`
+4. **Wait for READY**: `make get-runtime` — poll until `"status": "READY"`
+5. **Reset state**: `make reset`
+6. **Create and trigger an issue**:
+   - `gh issue create --repo KBB99/riv2025-long-horizon-coding-agent-demo --title "[MVP] Canopy Build" --body "Build the Canopy app as specified in BUILD_PLAN.md."`
+   - Add rocket reaction to the new issue
+   - `gh workflow run "Agent Builder" --repo KBB99/riv2025-long-horizon-coding-agent-demo -f issue_number=<ISSUE_NUM>`
+7. **Show monitoring commands** from the "Monitoring the Agent" section below
+
+---
+
+#### Path B: Create a New Project
+
+Guide the user through interactive BUILD_PLAN creation:
+
+1. **Ask** the user to describe their app in a few sentences — what it does, who it's for
+2. **Ask** about tech stack preferences. Suggest defaults (React + Vite + Tailwind frontend, Lambda + DynamoDB + CDK backend) but accept any choice. If they pick a non-default stack, note which CI/CD workflows or IAM policies may need adjustment:
+   - Non-Vite frontend → update `deploy-preview.yml` build step
+   - Non-Lambda backend → need new deploy workflow (the existing `deploy-infrastructure.yml` assumes CDK + Lambda)
+   - Non-DynamoDB database → may need VPC config in CDK stack
+3. **Ask** about key features, pages, and data models — enough detail to populate the BUILD_PLAN
+4. **Read** `prompts/BUILD_PLAN_TEMPLATE.md` for the skeleton structure
+5. **Generate** `prompts/{name}/BUILD_PLAN.md` filling in all sections from user input
+6. **Show** the generated plan and iterate until the user approves
+7. **Optionally generate** `prompts/{name}/EXAMPLE_TEST.txt` and `prompts/{name}/DEBUGGING_GUIDE.md`
+8. **Deploy and launch** — same steps as Path A but with `PROJECT_NAME={name}`:
+   - Docker rebuild (prompts are baked into the image)
+   - `make update-runtime-env PROJECT_NAME={name}`
+   - `make reset`
+   - Create GitHub issue referencing their project
+   - Trigger the agent workflow
+   - Show monitoring commands
+
+## Current State (2026-02-26)
 
 ### What's Working
 
@@ -44,15 +111,7 @@ The previous agent runs (issues #17, #22) showed the agent writing CDK infrastru
 - `claude_code.py` continuation message simplified to check deploy-state and wire `VITE_API_URL` if missing
 - Added `--region us-east-1` to all SSM commands (was missing before)
 
-**Status: NOT YET TESTED.** These prompt changes need a live agent run to verify the agent actually follows the wait-then-wire flow. Next step is to rebuild the Docker image, push to ECR, and trigger a new issue.
-
-### Next: Live Test of CDK-First Flow
-
-To validate the prompt changes from `3744400`:
-1. Rebuild and push Docker image (prompts are baked in)
-2. `make update-runtime-env` and `make reset`
-3. Trigger a new issue and monitor CloudWatch for SSM polling activity
-4. Verify the agent: commits CDK + stubs first, polls deploy-state, writes full handlers after deployment succeeds, and creates `frontend/.env` with `VITE_API_URL`
+**Status: VERIFIED (2026-02-26).** Live agent run confirmed the agent follows the CDK-first wait-then-wire flow: commits CDK + stubs first, polls SSM deploy-state, writes full handlers after deployment succeeds, and creates `frontend/.env` with `VITE_API_URL`.
 
 ### Previous Fixes (for reference)
 
