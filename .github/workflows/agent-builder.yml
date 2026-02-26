@@ -44,7 +44,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  AGENTCORE_AGENT_ID: claude_code_reinvent-1eBYMO7kHw
+  AGENTCORE_AGENT_ID: claude_code_reinvent-ASkTHpHaeh
 
 jobs:
   # Check if the issue is approved and ready to build
@@ -381,7 +381,7 @@ jobs:
           pip install --upgrade boto3 -q
 
           python3 .github/scripts/invoke_agent.py \
-            --agent-arn "arn:aws:bedrock-agentcore:us-east-1:669298908997:runtime/${AGENTCORE_AGENT_ID}" \
+            --agent-arn "arn:aws:bedrock-agentcore:us-east-1:405645222728:runtime/${AGENTCORE_AGENT_ID}" \
             --session-id "$SESSION_ID" \
             --payload "$PAYLOAD" \
             --region us-east-1

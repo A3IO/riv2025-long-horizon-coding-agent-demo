@@ -13,10 +13,10 @@ STACK_NAME ?= claude-code-$(ENVIRONMENT)
 
 # AgentCore runtime (from .bedrock_agentcore.yaml or environment)
 # Set these via environment variables or override on command line
-AGENT_RUNTIME_ID ?= claude_code_reinvent-1eBYMO7kHw
-EXECUTION_ROLE_ARN ?= arn:aws:iam::669298908997:role/claude-code-agentcore-role
+AGENT_RUNTIME_ID ?= claude_code_reinvent-ASkTHpHaeh
+EXECUTION_ROLE_ARN ?= arn:aws:iam::405645222728:role/claude-code-agentcore-role
 AGENTCORE_ROLE_NAME ?= claude-code-agentcore-role
-VPC_ID ?= vpc-04be60df8488bb6e5
+VPC_ID ?= vpc-02aedef4867b958e2
 
 # Agent configuration (environment variables)
 PUSH_INTERVAL_SECONDS ?= 300
@@ -24,7 +24,7 @@ SCREENSHOT_INTERVAL_SECONDS ?= 300
 SESSION_DURATION_HOURS ?= 1.0
 DEFAULT_MODEL ?= us.anthropic.claude-opus-4-6-v1
 PROJECT_NAME ?= canopy
-BASE_BRANCH ?= kb/improved-harness
+BASE_BRANCH ?= main
 
 # OpenTelemetry Configuration
 # Based on: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html
@@ -55,7 +55,7 @@ SCREENSHOT_CDN_DOMAIN := $(shell aws cloudformation describe-stacks --stack-name
 ECR_URI := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text 2>/dev/null)
 
 # GitHub configuration
-GITHUB_REPO ?= KBB99/riv2025-long-horizon-coding-agent-demo
+GITHUB_REPO ?= jeffzeng-aws/riv2025-long-horizon-coding-agent-demo
 
 .PHONY: help launch launch-local deploy-infra status destroy show-config update-runtime-env get-runtime cleanup-test stop-session reset
 
