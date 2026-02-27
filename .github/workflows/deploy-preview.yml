@@ -23,7 +23,7 @@ on:
       - 'generated-app/**'
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ vars.AWS_REGION }}
   NODE_VERSION: '20'
 
 # Cancel any in-progress deploy for the same branch
@@ -158,7 +158,7 @@ jobs:
         run: |
           # Check if infrastructure stack exists and get API URL
           API_URL=$(aws cloudformation describe-stacks \
-            --stack-name canopy-app-stack \
+            --stack-name ${{ vars.APP_CDK_STACK_NAME }} \
             --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
             --output text 2>/dev/null || echo "")
           if [ -n "$API_URL" ] && [ "$API_URL" != "None" ]; then

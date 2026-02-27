@@ -17,7 +17,7 @@ permissions:
   id-token: write
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ vars.AWS_REGION }}
   NODE_VERSION: '20'
 
 # Cancel any in-progress deploy for the same branch
@@ -219,7 +219,7 @@ jobs:
           ISSUE_NUMBER: ${{ steps.extract-issue.outputs.issue_number }}
           API_URL: ${{ steps.deploy.outputs.api_url }}
         run: |
-          BODY=$(printf '## Infrastructure Deployed\n\n| Resource | Value |\n|----------|-------|\n| **API URL** | %s |\n| **Stack** | `canopy-app-stack` |\n\n---\n*Deployed via CDK on push to `agent-runtime` branch*' "$API_URL")
+          BODY=$(printf '## Infrastructure Deployed\n\n| Resource | Value |\n|----------|-------|\n| **API URL** | %s |\n| **Stack** | `${{ vars.APP_CDK_STACK_NAME }}` |\n\n---\n*Deployed via CDK on push to `agent-runtime` branch*' "$API_URL")
           gh issue comment "$ISSUE_NUMBER" --body "$BODY"
 
   # Trigger frontend redeploy with API URL

@@ -1,6 +1,9 @@
 # AgentCore Deployment Makefile
 # Provides repeatable IaC for launching and managing the agent
 
+# Load local overrides (copy Makefile.local.example → Makefile.local and fill in values)
+-include Makefile.local
+
 # AWS Configuration
 AWS_PROFILE ?= default
 AWS_REGION ?= us-east-1
@@ -8,20 +11,24 @@ export AWS_PROFILE
 export AWS_REGION
 
 # Stack configuration (infrastructure naming)
-ENVIRONMENT ?= reinvent
+ENVIRONMENT ?= dev
 STACK_NAME ?= claude-code-$(ENVIRONMENT)
 
-# AgentCore runtime (from .bedrock_agentcore.yaml or environment)
-# Set these via environment variables or override on command line
-AGENT_RUNTIME_ID ?= claude_code_reinvent-ASkTHpHaeh
-EXECUTION_ROLE_ARN ?= arn:aws:iam::405645222728:role/claude-code-agentcore-role
+# AgentCore runtime — set in Makefile.local after running 'make create-runtime'
+AGENT_RUNTIME_ID ?=
+EXECUTION_ROLE_ARN ?=
 AGENTCORE_ROLE_NAME ?= claude-code-agentcore-role
-VPC_ID ?= vpc-02aedef4867b958e2
+VPC_ID ?=
+
+# Dynamic account ID (resolved at runtime from AWS credentials)
+AWS_ACCOUNT_ID := $(shell aws sts get-caller-identity --query Account --output text --region $(AWS_REGION) --profile $(AWS_PROFILE) 2>/dev/null)
+# Derived AgentCore runtime ARN (built from components so it's always consistent)
+AGENT_RUNTIME_ARN ?= arn:aws:bedrock-agentcore:$(AWS_REGION):$(AWS_ACCOUNT_ID):runtime/$(AGENT_RUNTIME_ID)
 
 # Agent configuration (environment variables)
 PUSH_INTERVAL_SECONDS ?= 300
 SCREENSHOT_INTERVAL_SECONDS ?= 300
-SESSION_DURATION_HOURS ?= 1.0
+SESSION_DURATION_HOURS ?= 7.0
 DEFAULT_MODEL ?= us.anthropic.claude-opus-4-6-v1
 PROJECT_NAME ?= canopy
 BASE_BRANCH ?= main
@@ -45,34 +52,37 @@ OTEL_TRACES_EXPORTER = otlp
 
 # Agent metadata for resource attributes
 AGENT_NAME ?= antodo_agent
-OTEL_RESOURCE_ATTRIBUTES = service.name=$(AGENT_NAME),aws.log.group.names=/aws/bedrock-agentcore/runtimes/$(AGENT_RUNTIME_ID)
-OTEL_EXPORTER_OTLP_LOGS_HEADERS = x-aws-log-group=/aws/bedrock-agentcore/runtimes/$(AGENT_RUNTIME_ID),x-aws-log-stream=runtime-logs,x-aws-metric-namespace=bedrock-agentcore
+OTEL_RESOURCE_ATTRIBUTES = service.name=$(AGENT_NAME),aws.log.group.names=/aws/bedrock-agentcore/runtimes/$(AGENT_RUNTIME_ID)-DEFAULT
+OTEL_EXPORTER_OTLP_LOGS_HEADERS = x-aws-log-group=/aws/bedrock-agentcore/runtimes/$(AGENT_RUNTIME_ID)-DEFAULT,x-aws-log-stream=runtime-logs,x-aws-metric-namespace=bedrock-agentcore
 
 # Get dynamic values from CloudFormation outputs
-CF_REGION := us-east-1
+CF_REGION := $(AWS_REGION)
 SCREENSHOT_BUCKET := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='ScreenshotsBucketName'].OutputValue" --output text 2>/dev/null)
 SCREENSHOT_CDN_DOMAIN := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='ScreenshotsCdnDomain'].OutputValue" --output text 2>/dev/null)
 ECR_URI := $(shell aws cloudformation describe-stacks --stack-name $(STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" --output text 2>/dev/null)
 
-# GitHub configuration
-GITHUB_REPO ?= jeffzeng-aws/riv2025-long-horizon-coding-agent-demo
+# CDK app stack name (the stack the agent deploys; set in Makefile.local)
+APP_STACK_NAME ?= $(PROJECT_NAME)-app-stack
 
-.PHONY: help launch launch-local deploy-infra status destroy show-config update-runtime-env get-runtime cleanup-test stop-session reset
+# GitHub configuration (set in Makefile.local)
+GITHUB_REPO ?=
+
+.PHONY: help create-runtime launch launch-local deploy-infra status destroy show-config update-runtime-env get-runtime cleanup-test stop-session reset
 
 help:
 	@echo "AgentCore Management Commands"
 	@echo ""
-	@echo "  make launch            - Deploy agent to cloud (CodeBuild + env vars)"
-	@echo "  make launch-local      - Run agent locally for testing"
+	@echo "  make create-runtime    - Create a new AgentCore runtime (first-time setup)"
 	@echo "  make update-runtime-env - Update env vars on existing runtime (AWS CLI)"
 	@echo "  make get-runtime       - Get current runtime configuration"
 	@echo "  make deploy-infra      - Deploy CDK infrastructure"
-	@echo "  make status            - Show AgentCore status"
-	@echo "  make destroy           - Destroy AgentCore runtime"
 	@echo "  make show-config       - Show current configuration values"
 	@echo "  make cleanup-test      - Clean up test issues, branches, and S3"
 	@echo "  make stop-session SESSION_ID=xxx - Stop a running agent session"
 	@echo "  make reset             - Wipe all agent state and start fresh"
+	@echo ""
+	@echo "  (Deprecated) make launch       - Use create-runtime for first-time setup"
+	@echo "  (Deprecated) make launch-local - agentcore CLI local mode"
 	@echo ""
 	@echo "Configuration (override with VAR=value):"
 	@echo "  AWS_PROFILE=$(AWS_PROFILE)"
@@ -122,8 +132,52 @@ deploy-infra:
 		-c vpcId=$(VPC_ID) \
 		-c agentCoreRoleName=$(AGENTCORE_ROLE_NAME)
 
+# Create a new AgentCore runtime (first-time setup, replaces broken 'agentcore launch')
+# After running, copy the agentRuntimeId from the output into Makefile.local as AGENT_RUNTIME_ID
+create-runtime:
+	@if [ -z "$(ECR_URI)" ]; then \
+		echo "Error: ECR_URI not found. Run 'make deploy-infra' first."; \
+		exit 1; \
+	fi
+	@if [ -z "$(EXECUTION_ROLE_ARN)" ]; then \
+		echo "Error: EXECUTION_ROLE_ARN not set. Add it to Makefile.local."; \
+		exit 1; \
+	fi
+	@echo "Creating AgentCore runtime '$(STACK_NAME)'..."
+	aws bedrock-agentcore-control create-agent-runtime \
+		--agent-runtime-name "$(STACK_NAME)" \
+		--region $(CF_REGION) \
+		--profile $(AWS_PROFILE) \
+		--role-arn $(EXECUTION_ROLE_ARN) \
+		--agent-runtime-artifact 'containerConfiguration={containerUri=$(ECR_URI):latest}' \
+		--network-configuration 'networkMode=PUBLIC' \
+		--environment-variables '{ \
+			"ENVIRONMENT": "$(ENVIRONMENT)", \
+			"PROJECT_NAME": "$(PROJECT_NAME)", \
+			"BASE_BRANCH": "$(BASE_BRANCH)", \
+			"CLAUDE_CODE_USE_BEDROCK": "1", \
+			"AWS_REGION": "$(AWS_REGION)", \
+			"PUSH_INTERVAL_SECONDS": "$(PUSH_INTERVAL_SECONDS)", \
+			"SCREENSHOT_INTERVAL_SECONDS": "$(SCREENSHOT_INTERVAL_SECONDS)", \
+			"SCREENSHOT_BUCKET": "$(SCREENSHOT_BUCKET)", \
+			"SCREENSHOT_CDN_DOMAIN": "$(SCREENSHOT_CDN_DOMAIN)", \
+			"SESSION_DURATION_HOURS": "$(SESSION_DURATION_HOURS)", \
+			"DEFAULT_MODEL": "$(DEFAULT_MODEL)", \
+			"CLAUDE_CODE_ENABLE_TELEMETRY": "$(CLAUDE_CODE_ENABLE_TELEMETRY)", \
+			"AGENT_OBSERVABILITY_ENABLED": "$(AGENT_OBSERVABILITY_ENABLED)", \
+			"OTEL_PYTHON_DISTRO": "$(OTEL_PYTHON_DISTRO)", \
+			"OTEL_PYTHON_CONFIGURATOR": "$(OTEL_PYTHON_CONFIGURATOR)", \
+			"OTEL_EXPORTER_OTLP_PROTOCOL": "$(OTEL_EXPORTER_OTLP_PROTOCOL)", \
+			"OTEL_TRACES_EXPORTER": "$(OTEL_TRACES_EXPORTER)", \
+			"OTEL_RESOURCE_ATTRIBUTES": "$(OTEL_RESOURCE_ATTRIBUTES)", \
+			"OTEL_EXPORTER_OTLP_LOGS_HEADERS": "$(OTEL_EXPORTER_OTLP_LOGS_HEADERS)" \
+		}'
+	@echo "✅ Runtime created. Copy the agentRuntimeId above into Makefile.local as AGENT_RUNTIME_ID."
+	@echo "   Then run: make update-runtime-env  (to populate AGENT_RUNTIME_ARN in the container env)"
+
 # Launch agent to cloud with environment variables
-# Note: agentcore CLI doesn't have --profile, so we set AWS_PROFILE env var
+# DEPRECATED: 'agentcore launch' CLI is broken; use 'make create-runtime' instead for first-time setup
+# This target is kept for backward compatibility / updating an existing runtime's config
 launch:
 	@if [ -z "$(SCREENSHOT_CDN_DOMAIN)" ]; then \
 		echo "Error: SCREENSHOT_CDN_DOMAIN not found. Run 'make deploy-infra' first."; \
@@ -210,6 +264,8 @@ update-runtime-env:
 			"BASE_BRANCH": "$(BASE_BRANCH)", \
 			"CLAUDE_CODE_USE_BEDROCK": "1", \
 			"AWS_REGION": "$(AWS_REGION)", \
+			"AGENT_RUNTIME_ID": "$(AGENT_RUNTIME_ID)", \
+			"AGENT_RUNTIME_ARN": "$(AGENT_RUNTIME_ARN)", \
 			"PUSH_INTERVAL_SECONDS": "$(PUSH_INTERVAL_SECONDS)", \
 			"SCREENSHOT_INTERVAL_SECONDS": "$(SCREENSHOT_INTERVAL_SECONDS)", \
 			"SCREENSHOT_BUCKET": "$(SCREENSHOT_BUCKET)", \
@@ -281,17 +337,17 @@ SCREENSHOTS_DISTRIBUTION_ID := $(shell aws cloudformation describe-stacks --stac
 reset:
 	@echo "⚠️  This will wipe all agent state. Press Ctrl+C to abort."
 	@echo ""
-	@echo "1/7 Destroying agent's CDK stack (canopy-app-stack)..."
-	@if aws cloudformation describe-stacks --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
+	@echo "1/7 Destroying agent's CDK stack ($(APP_STACK_NAME))..."
+	@if aws cloudformation describe-stacks --stack-name $(APP_STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
 		if [ -d "generated-app/infrastructure" ]; then \
-			cd generated-app/infrastructure && npx cdk destroy --force canopy-app-stack 2>&1 && echo "     Stack destroyed" || echo "     cdk destroy failed, trying cloudformation delete-stack..."; \
+			cd generated-app/infrastructure && npx cdk destroy --force $(APP_STACK_NAME) 2>&1 && echo "     Stack destroyed" || echo "     cdk destroy failed, trying cloudformation delete-stack..."; \
 		fi; \
-		if aws cloudformation describe-stacks --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
-			aws cloudformation delete-stack --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) 2>&1 && echo "     delete-stack issued, waiting..." || echo "     delete-stack failed (ok)"; \
-			aws cloudformation wait stack-delete-complete --stack-name canopy-app-stack --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Stack deleted" || echo "     Wait timed out (check manually)"; \
+		if aws cloudformation describe-stacks --stack-name $(APP_STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) >/dev/null 2>&1; then \
+			aws cloudformation delete-stack --stack-name $(APP_STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) 2>&1 && echo "     delete-stack issued, waiting..." || echo "     delete-stack failed (ok)"; \
+			aws cloudformation wait stack-delete-complete --stack-name $(APP_STACK_NAME) --region $(CF_REGION) --profile $(AWS_PROFILE) 2>/dev/null && echo "     Stack deleted" || echo "     Wait timed out (check manually)"; \
 		fi; \
 	else \
-		echo "     canopy-app-stack not found (ok)"; \
+		echo "     $(APP_STACK_NAME) not found (ok)"; \
 	fi
 	@echo ""
 	@echo "2/7 Deleting agent-runtime branch (remote)..."

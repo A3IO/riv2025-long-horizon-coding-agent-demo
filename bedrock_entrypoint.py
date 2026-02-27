@@ -52,6 +52,21 @@ except ImportError:
     GitHubConfig = None
     print("⚠️ GitManager not available (running locally?)")
 
+def _resolve_agent_runtime_arn() -> str:
+    """Return the AgentCore runtime ARN from env, or build it dynamically."""
+    arn = os.environ.get("AGENT_RUNTIME_ARN", "")
+    if not arn:
+        runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
+        if runtime_id:
+            try:
+                region = os.environ.get("AWS_REGION", "us-east-1")
+                acct = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+                arn = f"arn:aws:bedrock-agentcore:{region}:{acct}:runtime/{runtime_id}"
+            except Exception:
+                pass
+    return arn
+
+
 # Track uploaded screenshots by content hash (for deduplication)
 uploaded_screenshots: set[str] = set()
 
@@ -1766,6 +1781,14 @@ def run_agent_background(
     else:
         env['ANTHROPIC_API_KEY'] = api_key
 
+    # Tell claude_code.py to look for prompts in the Docker image's /app/prompts/
+    # directory rather than in the cloned repo's working directory.
+    # The target repo doesn't commit prompts/ — they are
+    # baked into the image. Without PROJECT_ROOT=/app, get_project_prompts_dir()
+    # looks in cwd (the cloned repo) and raises FileNotFoundError, causing the
+    # subprocess to exit immediately with code 0, triggering the agent-complete path.
+    env['PROJECT_ROOT'] = '/app'
+
     # Start agent subprocess - capture stderr to detect early failures
     agent_process = subprocess.Popen(
         cmd,
@@ -2044,10 +2067,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
             }
 
             # Post session info to GitHub issue for tracking
-            agent_runtime_arn = os.environ.get(
-                "AGENT_RUNTIME_ARN",
-                "arn:aws:bedrock-agentcore:us-east-1:669298908997:runtime/claude_code_reinvent-1eBYMO7kHw"
-            )
+            agent_runtime_arn = _resolve_agent_runtime_arn()
 
             # If resuming, post a resume notification instead of new session info
             if resume_session and restart_count > 0:
@@ -2120,6 +2140,25 @@ Progress will continue from where the previous session left off.""")
     # Register async background task with AgentCore
     task_id = app.add_async_task(f"building_{project}")
     print(f"📋 Registered async task: {task_id}")
+
+    # Clear any stale agent_state.json from EFS before starting a fresh session.
+    # EFS persists across container restarts and git operations do not remove
+    # untracked files. If a prior session wrote desired_state="pause" to signal
+    # completion, the new session would read that file and immediately mark the
+    # issue complete (within ~7 seconds) without doing any work.
+    # We DELETE the file (instead of updating it) because _set_agent_desired_state
+    # is a no-op when the file does not exist. Deleting guarantees claude_code.py
+    # will create a fresh file with desired_state="continuous" on startup.
+    if not resume_session:
+        for stale_path in [
+            AGENT_RUNTIME_DIR / "generated-app" / "agent_state.json",
+            AGENT_RUNTIME_DIR / "agent_state.json",
+        ]:
+            if stale_path.exists():
+                stale_path.unlink()
+                print(f"🧹 Removed stale agent_state.json at {stale_path}")
+            else:
+                print(f"✅ No stale agent_state.json at {stale_path} (already clean)")
 
     # Start agent in background thread
     # Pass github_repo via env var so the background push loop can use it
@@ -2366,10 +2405,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
                         store_session_state_ssm(issue_number, session_id=context.session_id)
 
                         # Post session info to the new issue
-                        agent_runtime_arn = os.environ.get(
-                            "AGENT_RUNTIME_ARN",
-                            "arn:aws:bedrock-agentcore:us-east-1:669298908997:runtime/claude_code_reinvent-1eBYMO7kHw"
-                        )
+                        agent_runtime_arn = _resolve_agent_runtime_arn()
                         post_session_info_to_issue(
                             github_repo=github_repo,
                             issue_number=issue_number,
@@ -2582,10 +2618,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
                         store_session_state_ssm(issue_number, session_id=context.session_id)
 
                         # Post session info to the new issue
-                        agent_runtime_arn = os.environ.get(
-                            "AGENT_RUNTIME_ARN",
-                            "arn:aws:bedrock-agentcore:us-east-1:669298908997:runtime/claude_code_reinvent-1eBYMO7kHw"
-                        )
+                        agent_runtime_arn = _resolve_agent_runtime_arn()
                         post_session_info_to_issue(
                             github_repo=github_repo,
                             issue_number=issue_number,

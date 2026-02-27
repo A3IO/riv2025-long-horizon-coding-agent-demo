@@ -222,7 +222,7 @@ The `opentelemetry-instrument` wrapper is critical — without it, ADOT doesn't 
 
 ### Main Entities
 
-**AgentCore Runtime** — The AWS-managed container environment. Identified by `claude_code_reinvent-1eBYMO7kHw`. Each session is a separate invocation. The runtime holds the Docker image and environment variables. Think of it as a managed EC2 that AWS provisions per-request.
+**AgentCore Runtime** — The AWS-managed container environment. Identified by its runtime ID (set as `AGENT_RUNTIME_ID` in `Makefile.local`). Each session is a separate invocation. The runtime holds the Docker image and environment variables. Think of it as a managed EC2 that AWS provisions per-request.
 
 **Session** — A single agent run, identified by a 33-character session ID. Lives for up to 8 hours. One session builds one issue. Tracked in SSM: `/claude-code/session-id`.
 
@@ -230,7 +230,7 @@ The `opentelemetry-instrument` wrapper is critical — without it, ADOT doesn't 
 
 **Project** — A named set of prompts under `prompts/{project-name}/`. The only required file is `BUILD_PLAN.md`. Currently only `canopy` exists. Set via `PROJECT_NAME` env var.
 
-**agent-runtime branch** — The Git branch where generated code lives. The agent clones the base branch (`kb/improved-harness`), checks out `agent-runtime`, and commits its work there. This branch is wiped on `make reset`.
+**agent-runtime branch** — The Git branch where generated code lives. The agent clones the base branch (`main`), checks out `agent-runtime`, and commits its work there. This branch is wiped on `make reset`.
 
 **deploy-state** — An SSM parameter at `/claude-code/infra/deploy-state`. JSON blob written by the `deploy-infrastructure.yml` workflow after CDK deploys succeed. Contains `ApiUrl`, `FrontendBucketName`, `DistributionId`, `status`. The agent polls this to know when infrastructure is ready.
 
@@ -299,7 +299,7 @@ The harness uses **AWS IAM** throughout:
 
 ### Prerequisites
 
-- AWS CLI configured with `default` profile, access to account `669298908997`
+- AWS CLI configured with `default` profile, access to your AWS account
 - Docker with `--platform linux/arm64` build support (or Rosetta on Apple Silicon)
 - Node.js + npm (for CDK and infrastructure)
 - `gh` CLI authenticated to GitHub
@@ -340,10 +340,10 @@ make update-runtime-env
 make reset
 
 # 5. Create an issue and trigger the agent
-gh issue create --repo KBB99/riv2025-long-horizon-coding-agent-demo \
+gh issue create --repo YOUR_ORG/YOUR_REPO \
   --title "[MVP] Canopy Build" \
   --body "Build the Canopy app as specified in BUILD_PLAN.md."
-gh api repos/KBB99/riv2025-long-horizon-coding-agent-demo/issues/ISSUE_NUM/reactions \
+gh api repos/YOUR_ORG/YOUR_REPO/issues/ISSUE_NUM/reactions \
   -f content=rocket
 make trigger ISSUE_NUM=N  # or use gh workflow run
 ```
@@ -353,7 +353,7 @@ make trigger ISSUE_NUM=N  # or use gh workflow run
 ```bash
 # Watch CloudWatch logs (last 5 minutes)
 aws logs filter-log-events \
-  --log-group-name "/aws/bedrock-agentcore/runtimes/claude_code_reinvent-1eBYMO7kHw" \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/<YOUR_RUNTIME_ID>-DEFAULT" \
   --start-time $(python3 -c "import datetime; print(int((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).timestamp() * 1000))") \
   --region us-east-1 --output json | python3 -c "
 import sys, json
@@ -367,7 +367,7 @@ for evt in data.get('events', []):
 "
 
 # Check agent-runtime commits
-gh api "repos/KBB99/riv2025-long-horizon-coding-agent-demo/commits?sha=agent-runtime&per_page=5" \
+gh api "repos/YOUR_ORG/YOUR_REPO/commits?sha=agent-runtime&per_page=5" \
   --jq '.[] | .sha[:8] + " " + .commit.author.date + " " + (.commit.message | split("\n")[0])'
 
 # Stop a stuck session
@@ -379,7 +379,7 @@ make stop-session SESSION_ID=<id-from-issue-comment>
 | Variable | Required | Secret? | Description |
 |---|---|---|---|
 | `PROJECT_NAME` | Yes | No | Which project to build (`canopy`) |
-| `BASE_BRANCH` | Yes | No | Harness code branch (`kb/improved-harness`) |
+| `BASE_BRANCH` | Yes | No | Harness code branch (`main`) |
 | `CLAUDE_CODE_USE_BEDROCK` | Yes | No | Set to `1` to use Bedrock endpoint |
 | `AWS_REGION` | Yes | No | `us-east-1` |
 | `DEFAULT_MODEL` | No | No | Model ID override |
@@ -521,7 +521,7 @@ This is the biggest architectural lesson. When the prompt said "graded on UI qua
 
 ### 9. CDK deploy without `vpcId` creates a new VPC
 
-The AWS account has a VPC limit. Always pass `-c vpcId=vpc-04be60df8488bb6e5` (or use `make deploy-infra` which sets this automatically). Creating an extra VPC by accident is annoying to clean up.
+The AWS account has a VPC limit. Always pass `-c vpcId=<YOUR_VPC_ID>` (or set `VPC_ID` in `Makefile.local` and use `make deploy-infra` which passes it automatically). Creating an extra VPC by accident is annoying to clean up.
 
 ### 10. f-string escaping in `bedrock_entrypoint.py`
 
@@ -614,10 +614,10 @@ The `ENVIRONMENT` variable in the Makefile sets the CloudFormation stack name su
 
 Defined in `infrastructure/lib/claude-code-stack.ts`:
 
-- **ECR Repository**: `669298908997.dkr.ecr.us-east-1.amazonaws.com/claude-code-reinvent` — Docker images for the agent
+- **ECR Repository**: `<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<projectName>-<environment>` — Docker images for the agent
 - **EFS File System**: Persistent storage for agent workspace (survives container restarts)
 - **Secrets Manager**: GitHub token and other secrets
-- **CloudWatch Log Group**: `/aws/bedrock-agentcore/runtimes/claude_code_reinvent-1eBYMO7kHw`
+- **CloudWatch Log Group**: `/aws/bedrock-agentcore/runtimes/<YOUR_RUNTIME_ID>-DEFAULT`
 - **S3 Buckets**: Screenshots/CDN bucket + deploy-preview bucket
 - **CloudFront**: Two distributions — one for screenshots CDN, one for the generated app preview
 - **IAM Roles**: `claude-code-agentcore-role` (container) + GitHub Actions OIDC role
@@ -690,4 +690,4 @@ This deletes: `agent-runtime` branch (local + remote), all open `agent-building`
 
 ---
 
-*This document was generated from the codebase as of `2026-02-25` on branch `kb/improved-harness`. If you find something that doesn't match reality, the code is ground truth — update this doc.*
+*This document was generated from the codebase as of `2026-02-25` on branch `main`. If you find something that doesn't match reality, the code is ground truth — update this doc.*

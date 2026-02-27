@@ -46,6 +46,10 @@ export class ClaudeCodeStack extends cdk.Stack {
     // Leave unset on first deploy (before AgentCore is created); redeploy after creating the runtime.
     const agentCoreRoleName = this.node.tryGetContext('agentCoreRoleName') || '';
 
+    // App name used to scope backend test policies to the agent-generated app stack.
+    // Defaults to 'canopy'; override with: cdk deploy -c appName=myapp
+    const appName = this.node.tryGetContext('appName') || 'canopy';
+
     // ========================================================================
     // VPC - Required for EFS
     // Import existing VPC via context, or create a new one
@@ -249,8 +253,8 @@ export class ClaudeCodeStack extends cdk.Stack {
               'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:GetItem', 'dynamodb:BatchGetItem',
             ],
             resources: [
-              `arn:aws:dynamodb:${this.region}:${this.account}:table/canopy-*`,
-              `arn:aws:dynamodb:${this.region}:${this.account}:table/canopy-*/index/*`,
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/${appName}-*`,
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/${appName}-*/index/*`,
             ],
           }),
           new iam.PolicyStatement({
@@ -260,15 +264,15 @@ export class ClaudeCodeStack extends cdk.Stack {
               'logs:DescribeLogGroups', 'logs:DescribeLogStreams',
             ],
             resources: [
-              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/canopy-*`,
-              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/canopy-*:*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/${appName}-*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/${appName}-*:*`,
             ],
           }),
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
             actions: ['lambda:InvokeFunction'],
             resources: [
-              `arn:aws:lambda:${this.region}:${this.account}:function:canopy-*`,
+              `arn:aws:lambda:${this.region}:${this.account}:function:${appName}-*`,
             ],
           }),
         ],
@@ -278,14 +282,20 @@ export class ClaudeCodeStack extends cdk.Stack {
       });
 
       new iam.ManagedPolicy(this, 'AgentCoreBedrockInvokePolicy', {
-        description: 'Allows AgentCore execution role to invoke Bedrock models',
+        description: 'Allows AgentCore execution role to invoke Bedrock models and cross-region inference profiles',
         statements: [
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
             actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
             resources: [
-              `arn:aws:bedrock:${this.region}::foundation-model/anthropic.*`,
-              `arn:aws:bedrock:us-*::foundation-model/anthropic.*`,
+              // Standard foundation models (any region)
+              `arn:aws:bedrock:*::foundation-model/anthropic.*`,
+              // Cross-region inference profiles (us.anthropic.* prefix)
+              `arn:aws:bedrock:*::foundation-model/us.anthropic.*`,
+              // Account-scoped inference profiles
+              `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+              // Deployment-region foundation models (catch-all)
+              `arn:aws:bedrock:${this.region}::foundation-model/*`,
             ],
           }),
         ],
@@ -294,8 +304,26 @@ export class ClaudeCodeStack extends cdk.Stack {
         ],
       });
 
+      new iam.ManagedPolicy(this, 'AgentCoreECRPolicy', {
+        description: 'Allows AgentCore execution role to pull container images from ECR',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'ecr:GetAuthorizationToken',
+              'ecr:BatchGetImage',
+              'ecr:GetDownloadUrlForLayer',
+            ],
+            resources: ['*'],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForECR', agentCoreRoleName),
+        ],
+      });
+
       new iam.ManagedPolicy(this, 'AgentCoreCloudWatchPolicy', {
-        description: 'Allows AgentCore execution role to push CloudWatch metrics',
+        description: 'Allows AgentCore execution role to push CloudWatch metrics and write logs',
         statements: [
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
@@ -304,6 +332,21 @@ export class ClaudeCodeStack extends cdk.Stack {
             conditions: {
               StringEquals: { 'cloudwatch:namespace': 'ClaudeCodeAgent' },
             },
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'logs:CreateLogGroup',
+              'logs:CreateLogStream',
+              'logs:PutLogEvents',
+              'logs:DescribeLogGroups',
+              'logs:DescribeLogStreams',
+              'logs:FilterLogEvents',
+            ],
+            resources: [
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/bedrock-agentcore/*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/bedrock-agentcore/*:*`,
+            ],
           }),
         ],
         roles: [

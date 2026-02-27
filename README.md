@@ -10,20 +10,28 @@ An autonomous agent system that builds full-stack applications from GitHub issue
 - GitHub repository with Actions enabled
 - Docker installed locally
 - AWS CLI and CDK configured
-- `agentcore` CLI installed (`pip install bedrock-agentcore`)
+- `agentcore` CLI installed (`pip install bedrock-agentcore`) — **Note**: the `agentcore launch/push/build` subcommands are broken; use `make` targets instead (see below)
 
 ### Deployment Steps
 
 ```bash
+# 0. Copy and fill in your local config
+cp Makefile.local.example Makefile.local
+# Edit Makefile.local: set AWS_PROFILE, AWS_REGION, VPC_ID, GITHUB_REPO
+
 # 1. Deploy CDK infrastructure (ECR, S3 buckets, CloudFront, IAM roles)
 make deploy-infra
 
-# 2. Build and push the Docker image
-agentcore build
-agentcore push
+# 2. Build and push the Docker image (ECR URI from: make show-config)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ECR_URI>
+docker build --platform linux/arm64 -t <ECR_URI>:latest .
+docker push <ECR_URI>:latest
 
-# 3. Launch the agent runtime
-make launch PROJECT_NAME=canopy
+# 3. Create the AgentCore runtime (first time only)
+make create-runtime
+# Copy the agentRuntimeId from the output into Makefile.local as AGENT_RUNTIME_ID
+# Then update the runtime environment:
+make update-runtime-env
 ```
 
 ### GitHub Setup
@@ -34,17 +42,21 @@ make launch PROJECT_NAME=canopy
    |--------|-------------|
    | `AWS_ACCESS_KEY_ID` | IAM user access key for GitHub Actions |
    | `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
-   | `AWS_AGENTCORE_ROLE_ARN` | IAM role ARN for invoking AgentCore |
-   | `AWS_PREVIEW_DEPLOY_ROLE_ARN` | IAM role ARN for deploying previews |
+   | `AWS_AGENTCORE_ROLE_ARN` | IAM role ARN for invoking AgentCore (output of CDK deploy) |
+   | `AWS_PREVIEW_DEPLOY_ROLE_ARN` | IAM role ARN for deploying previews (output of CDK deploy) |
+   | `AWS_INFRA_DEPLOY_ROLE_ARN` | IAM role ARN for deploying agent-written CDK infra (output of CDK deploy) |
 
 2. **Variables** (Settings > Secrets and variables > Actions > Variables):
 
    | Variable | Description |
    |----------|-------------|
    | `AUTHORIZED_APPROVERS` | Comma-separated GitHub usernames who can approve builds |
-   | `PREVIEWS_BUCKET_NAME` | S3 bucket for preview deployments |
-   | `PREVIEWS_CDN_DOMAIN` | CloudFront domain for previews |
-   | `PREVIEWS_DISTRIBUTION_ID` | CloudFront distribution ID for cache invalidation |
+   | `AWS_REGION` | AWS region where infrastructure is deployed (e.g. `us-east-1`) |
+   | `AGENTCORE_AGENT_ID` | AgentCore runtime ID (from `make create-runtime` output) |
+   | `APP_CDK_STACK_NAME` | CDK stack name for agent-generated app (e.g. `canopy-app-stack`) |
+   | `PREVIEWS_BUCKET_NAME` | S3 bucket for preview deployments (output of CDK deploy) |
+   | `PREVIEWS_CDN_DOMAIN` | CloudFront domain for previews (output of CDK deploy) |
+   | `PREVIEWS_DISTRIBUTION_ID` | CloudFront distribution ID for cache invalidation (output of CDK deploy) |
 
 3. **Labels** (must exist for workflows):
 
@@ -157,12 +169,12 @@ Key variables (set in `Makefile` or via environment):
 |----------|---------|-------------|
 | `PROJECT_NAME` | `canopy` | Which build plan to use (`prompts/{name}/`) |
 | `DEFAULT_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Bedrock model ID |
-| `SESSION_DURATION_HOURS` | `1.0` | Max agent session length |
+| `SESSION_DURATION_HOURS` | `7.0` | Max agent session length |
 | `PUSH_INTERVAL_SECONDS` | `300` | How often to push commits |
 | `SCREENSHOT_INTERVAL_SECONDS` | `300` | How often to capture screenshots |
 | `AWS_PROFILE` | `default` | AWS CLI profile |
 | `AWS_REGION` | `us-east-1` | AWS region |
-| `GITHUB_REPO` | `KBB99/riv2025-long-horizon-coding-agent-demo` | Target GitHub repo |
+| `GITHUB_REPO` | _(set in Makefile.local)_ | Target GitHub repo (owner/repo) |
 
 Run `make show-config` to see all current values.
 
