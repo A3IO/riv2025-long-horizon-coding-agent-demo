@@ -1012,7 +1012,7 @@ def _create_claude_client(
             "Edit",
             "MultiEdit",
             "Bash",
-            "Task",
+            "Agent",
         ],
         disallowed_tools=[],
         mcp_servers={},
