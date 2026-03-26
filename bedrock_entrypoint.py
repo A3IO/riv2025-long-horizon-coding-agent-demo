@@ -251,7 +251,7 @@ exit 0
         hook_path.write_text(hook_script)
 
         # Make it executable
-        os.chmod(hook_path, 0o755)
+        os.chmod(hook_path, 0o750)
 
         print(f"✅ Post-commit hook installed at {hook_path}")
         return True
@@ -2508,12 +2508,12 @@ Commits should reference this issue: `Ref: #{issue_number}`
                 print(f"{'='*80}\n")
 
                 try:
-                    os.system("git config user.name 'Claude Code Agent'")
-                    os.system("git config user.email 'agent@anthropic.com'")
+                    subprocess.run(["git", "config", "user.name", "Claude Code Agent"], check=False)
+                    subprocess.run(["git", "config", "user.email", "agent@anthropic.com"], check=False)
 
                     gh_token = get_github_token(github_repo)
-                    os.system(f"git remote add origin https://x-access-token:{gh_token}@github.com/{github_repo}.git || true")
-                    push_result = os.system(f"git push -u origin {target_branch}")
+                    subprocess.run(["git", "remote", "add", "origin", f"https://x-access-token:{gh_token}@github.com/{github_repo}.git"], check=False)
+                    push_result = subprocess.run(["git", "push", "-u", "origin", target_branch]).returncode
 
                     if push_result == 0:
                         yield {
