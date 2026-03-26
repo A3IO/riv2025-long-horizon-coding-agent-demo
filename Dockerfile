@@ -2,7 +2,7 @@ FROM public.ecr.aws/docker/library/python:3.12-slim
 
 # Install system dependencies for Playwright, git operations, and process management
 # Also includes Chromium dependencies for Playwright headless browser
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     nodejs \
@@ -57,7 +57,7 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN npm install -g aws-cdk
 
 # AWS CLI v2 for deployment verification (detect architecture for cross-platform builds)
-RUN apt-get update && apt-get install -y unzip \
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
     && ARCH=$(dpkg --print-architecture) \
     && if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
          AWS_CLI_URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip"; \
@@ -81,6 +81,10 @@ RUN useradd -m -s /bin/bash agent \
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import os; os.path.exists('/app/bedrock_entrypoint.py')" || exit 1
 
 # Switch to non-root user
 USER agent
