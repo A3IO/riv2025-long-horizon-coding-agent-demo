@@ -558,7 +558,53 @@ function handler(event) {
 
     // ========================================================================
     // IAM Role for GitHub Actions Infrastructure Deployment (CDK)
+    //
+    // Threat model: this role runs `cdk deploy --require-approval never` on
+    // CDK code the agent generated and pushed to `agent-runtime`. It must be
+    // able to provision the app's resources, but it must NOT be able to grant
+    // itself (or any role it creates) more privilege than that. The control
+    // is a permissions boundary that every agent-created IAM role MUST carry.
     // ========================================================================
+
+    // Permissions boundary that caps what any agent-created IAM role may do.
+    // Even if the agent attaches AdministratorAccess to a role it creates,
+    // the effective permissions are the intersection with this boundary.
+    const agentRoleBoundary = new iam.ManagedPolicy(this, 'AgentCreatedRoleBoundary', {
+      managedPolicyName: `${projectName}-${environment}-agent-role-boundary`,
+      description:
+        'Permissions boundary required on all IAM roles created by agent-generated CDK stacks. ' +
+        'Caps those roles to the application data plane regardless of policies attached.',
+      statements: [
+        new iam.PolicyStatement({
+          sid: 'AppDataPlane',
+          effect: iam.Effect.ALLOW,
+          actions: [
+            'dynamodb:*',
+            'lambda:InvokeFunction',
+            'logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents',
+            'logs:DescribeLogGroups', 'logs:DescribeLogStreams',
+            's3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket',
+            'execute-api:Invoke', 'execute-api:ManageConnections',
+            'xray:PutTraceSegments', 'xray:PutTelemetryRecords',
+            'ssm:GetParameter', 'ssm:GetParameters',
+          ],
+          resources: ['*'],
+        }),
+        // Explicitly deny privilege-escalation primitives inside the boundary
+        // so an agent-created role can never mint or modify other roles, even
+        // if an attached policy allows it.
+        new iam.PolicyStatement({
+          sid: 'DenyPrivescInsideBoundary',
+          effect: iam.Effect.DENY,
+          actions: [
+            'iam:*', 'sts:AssumeRole', 'organizations:*',
+            'secretsmanager:*', 'kms:Decrypt', 'kms:CreateGrant',
+          ],
+          resources: ['*'],
+        }),
+      ],
+    });
+
     const infraDeployRole = new iam.Role(this, 'GitHubInfraDeployRole', {
       roleName: `${projectName}-github-infra-deploy`,
       description: 'Role for GitHub Actions to deploy agent-written CDK infrastructure',
@@ -574,8 +620,11 @@ function handler(event) {
       })
     );
 
-    // Scoped allowlist: only these services can be provisioned
+    // Service permissions for provisioning the app's resources. IAM-write
+    // actions are intentionally NOT in this statement — they are granted
+    // separately below with a permissions-boundary condition.
     infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ProvisionAppResources',
       effect: iam.Effect.ALLOW,
       actions: [
         // CloudFormation (required for CDK)
@@ -587,14 +636,10 @@ function handler(event) {
         'apigatewayv2:*',
         // DynamoDB
         'dynamodb:*',
-        // IAM (scoped to stack-created roles)
-        'iam:CreateRole', 'iam:DeleteRole', 'iam:AttachRolePolicy',
-        'iam:DetachRolePolicy', 'iam:PutRolePolicy', 'iam:DeleteRolePolicy',
-        'iam:GetRole', 'iam:GetRolePolicy', 'iam:PassRole', 'iam:TagRole',
-        'iam:UntagRole', 'iam:UpdateRole', 'iam:ListRolePolicies',
-        'iam:ListAttachedRolePolicies', 'iam:CreatePolicy', 'iam:DeletePolicy',
-        'iam:GetPolicy', 'iam:GetPolicyVersion', 'iam:ListPolicyVersions',
-        'iam:CreatePolicyVersion', 'iam:DeletePolicyVersion',
+        // IAM read-only (CDK needs to look up roles it creates)
+        'iam:GetRole', 'iam:GetRolePolicy', 'iam:GetPolicy',
+        'iam:GetPolicyVersion', 'iam:ListRolePolicies',
+        'iam:ListAttachedRolePolicies', 'iam:ListPolicyVersions',
         // S3 (for CDK assets + app deployment)
         's3:*',
         // CloudFront
@@ -611,8 +656,63 @@ function handler(event) {
       resources: ['*'],  // Scoped by service, not resource ARN (CDK creates dynamic names)
     }));
 
-    // DENY expensive/dangerous services explicitly
+    // IAM role lifecycle — only with the permissions boundary attached.
+    // Without `iam:PermissionsBoundary == agentRoleBoundary`, CreateRole and
+    // PutRolePermissionsBoundary are denied, so the agent's CDK cannot mint
+    // an unbounded role. The deploy workflow passes
+    // `--context @aws-cdk/core:permissionsBoundary` so vanilla CDK constructs
+    // attach the boundary automatically.
     infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CreateBoundedRolesOnly',
+      effect: iam.Effect.ALLOW,
+      actions: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'iam:PermissionsBoundary': agentRoleBoundary.managedPolicyArn,
+        },
+      },
+    }));
+
+    // Mutating a role's policies is only allowed when the *target role*
+    // already carries the permissions boundary. This stops the agent's CDK
+    // from importing a pre-existing privileged role
+    // (`iam.Role.fromRoleName(...)`) and attaching AdministratorAccess to it
+    // — the role lacks the boundary, so the condition fails.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ModifyBoundedRolesOnly',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'iam:AttachRolePolicy', 'iam:DetachRolePolicy',
+        'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:DeleteRole',
+      ],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'iam:PermissionsBoundary': agentRoleBoundary.managedPolicyArn,
+        },
+      },
+    }));
+
+    // Role metadata, managed-policy lifecycle, and PassRole. These actions
+    // don't support the iam:PermissionsBoundary condition key, so they are
+    // gated by the explicit DENY on privileged roles below instead.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ManageRoleMetadataAndPolicies',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'iam:UpdateRole', 'iam:TagRole', 'iam:UntagRole',
+        'iam:UpdateAssumeRolePolicy',
+        'iam:CreatePolicy', 'iam:DeletePolicy',
+        'iam:CreatePolicyVersion', 'iam:DeletePolicyVersion',
+        'iam:PassRole',
+      ],
+      resources: ['*'],
+    }));
+
+    // DENY expensive/dangerous services explicitly.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyExpensiveServices',
       effect: iam.Effect.DENY,
       actions: [
         'rds:*', 'ec2:RunInstances', 'ec2:CreateNatGateway',
@@ -621,6 +721,51 @@ function handler(event) {
         'sagemaker:*', 'bedrock:*',
       ],
       resources: ['*'],
+    }));
+
+    // The boundary is the load-bearing control. Removing it from a role, or
+    // mutating the boundary policy itself, must always be denied — explicit
+    // DENY beats any ALLOW above.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyBoundaryTampering',
+      effect: iam.Effect.DENY,
+      actions: [
+        'iam:DeleteRolePermissionsBoundary',
+        'iam:DeletePolicy',
+        'iam:DeletePolicyVersion',
+        'iam:CreatePolicyVersion',
+        'iam:SetDefaultPolicyVersion',
+      ],
+      resources: [agentRoleBoundary.managedPolicyArn],
+    }));
+
+    // Hard deny on tampering with this project's own privileged roles, the
+    // AgentCore execution role, and the CDK bootstrap roles. Covers PassRole
+    // (a Lambda can't inherit these roles), UpdateAssumeRolePolicy (can't
+    // widen who may assume them), policy attach/put (can't add permissions),
+    // and PutRolePermissionsBoundary (can't replace their boundary or DoS
+    // them by adding the agent boundary).
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyTamperPrivilegedRoles',
+      effect: iam.Effect.DENY,
+      actions: [
+        'iam:PassRole',
+        'iam:UpdateAssumeRolePolicy',
+        'iam:AttachRolePolicy', 'iam:DetachRolePolicy',
+        'iam:PutRolePolicy', 'iam:DeleteRolePolicy',
+        'iam:PutRolePermissionsBoundary', 'iam:DeleteRolePermissionsBoundary',
+        'iam:DeleteRole', 'iam:UpdateRole', 'iam:CreateRole',
+      ],
+      resources: [
+        `arn:aws:iam::${this.account}:role/${projectName}-*`,
+        `arn:aws:iam::${this.account}:role/AmazonBedrockAgentCore*`,
+        ...(agentCoreRoleName
+          ? [`arn:aws:iam::${this.account}:role/${agentCoreRoleName}`]
+          : []),
+        `arn:aws:iam::${this.account}:role/cdk-*`,
+        `arn:aws:iam::${this.account}:role/aws-service-role/*`,
+        infraDeployRole.roleArn,
+      ],
     }));
 
     // Allow GitHub Actions user to assume the infra deploy role

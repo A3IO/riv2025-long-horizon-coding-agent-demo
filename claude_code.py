@@ -554,6 +554,7 @@ You are enhancing an EXISTING application. Your task is to implement the feature
 - Add the requested functionality as described above
 - Follow the existing code patterns and style
 - Add NEW tests to tests.json for the new feature (append to existing array)
+- Every tests.json entry MUST include a "category" field: "shared", "infrastructure", "backend", or "frontend". Only shared/infrastructure/backend tests may use backend-verify.cjs; frontend tests require a Playwright screenshot.
 - Update claude-progress.txt with your changes
 
 ### 4. Testing Your Changes

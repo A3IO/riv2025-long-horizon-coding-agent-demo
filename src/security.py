@@ -1,6 +1,7 @@
 """Security utilities for Claude Code."""
 
 import glob
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -91,6 +92,58 @@ def _extract_test_id(old_string: str, new_string: str) -> Optional[str]:
         # Convert to slug: "First Time User" -> "first-time-user"
         slug = re.sub(r'[^a-zA-Z0-9]+', '-', name.lower()).strip('-')
         return slug
+
+    return None
+
+
+# Test categories that may use the backend-verify.cjs verification path
+# (shell-command-based) instead of the Playwright screenshot path.
+# Anything not in this set — including a missing/unknown category — must
+# produce a screenshot, since the screenshot gate is the only verification
+# we have for UI behavior.
+BACKEND_VERIFY_CATEGORIES = frozenset({"shared", "infrastructure", "backend"})
+
+
+def _extract_test_category(tests_json_path: str, test_id: str) -> Optional[str]:
+    """Determine the category of the test being marked as passing.
+
+    Reads tests.json from disk and locates the entry by id (or slugified
+    name). The category is deliberately NOT taken from the Edit tool's
+    old_string/new_string: new_string is fully agent-controlled, so an edit
+    like ``Edit("\\"passes\\": false", "\\"category\\": \\"backend\\", \\"passes\\": true")``
+    could spoof a category that the on-disk file never declared. The file is
+    the only authority. If the file is missing, unparseable, or the test
+    isn't in it, return None and the caller fails closed (screenshot path).
+
+    Args:
+        tests_json_path: Path to the tests.json file being edited.
+        test_id: The test id being marked as passing.
+
+    Returns:
+        Lower-cased category string (e.g. "frontend", "backend") or None.
+    """
+    try:
+        data = json.loads(Path(tests_json_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+    # tests.json may be a top-level array or {"tests": [...]}.
+    entries = data.get("tests", data) if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        # Also match against a slugified name, mirroring _extract_test_id.
+        entry_name = entry.get("name", "")
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(entry_name).lower()).strip("-")
+        if entry_id == test_id or slug == test_id:
+            category = entry.get("category")
+            if isinstance(category, str):
+                return category.strip().lower()
+            return None
 
     return None
 
@@ -758,13 +811,43 @@ class SecurityValidator:
         # =====================================================================
         # Alternative path: Backend verification via backend-verify.cjs
         # If a -result.txt file exists for this test, use that instead of
-        # requiring a screenshot (for shared/infra/backend tests)
+        # requiring a screenshot — but ONLY for tests that explicitly declare
+        # a non-frontend category. Otherwise the agent could write a trivial
+        # backend-verify result (e.g. `--command "npx tsc --version"`) for a
+        # UI test and bypass the screenshot gate entirely.
         # =====================================================================
         result_file_pattern = f"{project_root}/screenshots/issue-{issue_number}/{test_id}-result.txt"
         result_files = glob.glob(result_file_pattern)
 
+        test_category = _extract_test_category(file_path, test_id)
+
+        if result_files and test_category not in BACKEND_VERIFY_CATEGORIES:
+            # A result file exists but the test isn't eligible for the
+            # backend-verify path. Deny here rather than silently falling
+            # through to the screenshot path — a stray result.txt for a UI
+            # test is a strong signal of an attempted bypass.
+            print(
+                f"🚨 BLOCKED: Test '{test_id}' has a backend-verify result file "
+                f"but its category is '{test_category or 'unset'}'"
+            )
+            return _deny_response(
+                f"Test '{test_id}' has a backend-verify result file, but the "
+                f"backend-verify.cjs path is only allowed for tests whose "
+                f"\"category\" field in tests.json is one of: "
+                f"{', '.join(sorted(BACKEND_VERIFY_CATEGORIES))}.\n\n"
+                f"This test's category is "
+                f"'{test_category if test_category else 'unset'}'.\n\n"
+                f"If this is a frontend/UI test, verify it with a Playwright "
+                f"screenshot:\n"
+                f"  node playwright-test.cjs --url <URL> --test-id {test_id} "
+                f"--output-dir screenshots/issue-{issue_number} --operation full\n\n"
+                f"If this is a shared/infrastructure/backend test, add a "
+                f"\"category\" field to its tests.json entry, e.g. "
+                f'"category": "backend".'
+            )
+
         if result_files:
-            # Backend verification path
+            # Backend verification path (category already validated above)
             result_file = result_files[0]
 
             # Check 1: Result file must have been viewed

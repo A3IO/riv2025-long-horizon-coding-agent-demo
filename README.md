@@ -1,5 +1,10 @@
 # Long-Horizon Coding Agent Demo
 
+> [!IMPORTANT]
+> **This repository is archived.** It was built for the AWS re:Invent 2025 demo and is no longer maintained. The code is provided as-is for reference. No further updates, bug fixes, or security patches will be made, and issues and pull requests will not be reviewed.
+>
+> If you adapt this code, treat it as a starting point — not a production-ready template. In particular, review the IAM policies, the agent's command allowlist, and the test-verification gates against your own threat model before deploying to any account that holds real workloads or data.
+
 An autonomous agent system that builds full-stack applications from GitHub issues using AWS Bedrock AgentCore and the Claude Agent SDK.
 
 ## Quick Start

@@ -274,6 +274,13 @@ After taking a screenshot, view it with the Read tool and fix any console errors
 
 For shared/, infrastructure/, and backend/ tests, use `backend-verify.cjs` instead of playwright-test.cjs. This script runs a shell command and produces verification artifacts in the same format the security system expects.
 
+**The security system enforces this strictly:** every entry in `tests.json` must include a `"category"` field set to one of `"shared"`, `"infrastructure"`, `"backend"`, or `"frontend"`. The backend-verify.cjs path is only accepted for tests whose category is `shared`, `infrastructure`, or `backend`. Frontend/UI tests (or any test without a declared category) must be verified with a Playwright screenshot — the system will block the edit otherwise.
+
+Example tests.json entry:
+```json
+{ "id": "api-list-projects", "category": "backend", "description": "GET /projects returns 200", "passes": false }
+```
+
 ```bash
 node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"
 ```
