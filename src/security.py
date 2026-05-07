@@ -1,6 +1,7 @@
 """Security utilities for Claude Code."""
 
 import glob
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -34,9 +35,14 @@ def track_screenshot_read(file_path: str) -> None:
         file_path: Path to the screenshot/console file that was read
     """
     if 'screenshots/' in file_path:
-        if file_path.endswith('.png') or file_path.endswith('-console.txt'):
+        if file_path.endswith('.png') or file_path.endswith('-console.txt') or file_path.endswith('-result.txt'):
             _viewed_screenshots.add(file_path)
-            file_type = "screenshot" if file_path.endswith('.png') else "console log"
+            if file_path.endswith('.png'):
+                file_type = "screenshot"
+            elif file_path.endswith('-result.txt'):
+                file_type = "backend result"
+            else:
+                file_type = "console log"
             print(f"📸 Tracked {file_type} view: {file_path}")
 
 
@@ -90,6 +96,58 @@ def _extract_test_id(old_string: str, new_string: str) -> Optional[str]:
     return None
 
 
+# Test categories that may use the backend-verify.cjs verification path
+# (shell-command-based) instead of the Playwright screenshot path.
+# Anything not in this set — including a missing/unknown category — must
+# produce a screenshot, since the screenshot gate is the only verification
+# we have for UI behavior.
+BACKEND_VERIFY_CATEGORIES = frozenset({"shared", "infrastructure", "backend"})
+
+
+def _extract_test_category(tests_json_path: str, test_id: str) -> Optional[str]:
+    """Determine the category of the test being marked as passing.
+
+    Reads tests.json from disk and locates the entry by id (or slugified
+    name). The category is deliberately NOT taken from the Edit tool's
+    old_string/new_string: new_string is fully agent-controlled, so an edit
+    like ``Edit("\\"passes\\": false", "\\"category\\": \\"backend\\", \\"passes\\": true")``
+    could spoof a category that the on-disk file never declared. The file is
+    the only authority. If the file is missing, unparseable, or the test
+    isn't in it, return None and the caller fails closed (screenshot path).
+
+    Args:
+        tests_json_path: Path to the tests.json file being edited.
+        test_id: The test id being marked as passing.
+
+    Returns:
+        Lower-cased category string (e.g. "frontend", "backend") or None.
+    """
+    try:
+        data = json.loads(Path(tests_json_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+    # tests.json may be a top-level array or {"tests": [...]}.
+    entries = data.get("tests", data) if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        # Also match against a slugified name, mirroring _extract_test_id.
+        entry_name = entry.get("name", "")
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(entry_name).lower()).strip("-")
+        if entry_id == test_id or slug == test_id:
+            category = entry.get("category")
+            if isinstance(category, str):
+                return category.strip().lower()
+            return None
+
+    return None
+
+
 def _deny_response(reason: str) -> dict[str, Any]:
     """Create a deny response for PreToolUse hooks.
 
@@ -137,6 +195,10 @@ class SecurityValidator:
                 file_path_resolved.relative_to(project_root_resolved)
                 return True, ""
             except ValueError:
+                # Allow CDK output directory (cdk.out/) which may be outside
+                # the immediate project root but under the workspace
+                if "cdk.out" in str(file_path_resolved):
+                    return True, ""
                 # Path is outside project root
                 return (
                     False,
@@ -344,6 +406,56 @@ class SecurityValidator:
         if tests_json_result:  # Non-empty means blocked
             return tests_json_result
 
+        # CDK command validation - allow synth/diff/test, block deploy/destroy
+        if first_word == "cdk":
+            blocked_cdk_subcommands = ["deploy", "destroy", "bootstrap"]
+            for subcmd in blocked_cdk_subcommands:
+                if subcmd in command:
+                    print(f"🚨 BLOCKED: cdk {subcmd} — infrastructure deployment happens via CI/CD")
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": f"cdk {subcmd} is blocked — infrastructure deployment happens via CI/CD, not the agent",
+                        }
+                    }
+
+        # AWS CLI validation - allow read-only, block mutations
+        if first_word == "aws":
+            allowed_aws_patterns = [
+                r"aws\s+cloudformation\s+describe-stacks",
+                r"aws\s+cloudformation\s+describe-stack-events",
+                r"aws\s+cloudformation\s+describe-stack-resources",
+                r"aws\s+cloudformation\s+list-stacks",
+                r"aws\s+apigateway\s+get-rest-apis",
+                r"aws\s+apigatewayv2\s+get-apis",
+                r"aws\s+lambda\s+get-function",
+                r"aws\s+lambda\s+list-functions",
+                r"aws\s+lambda\s+invoke",
+                r"aws\s+dynamodb\s+describe-table",
+                r"aws\s+dynamodb\s+list-tables",
+                r"aws\s+dynamodb\s+scan",
+                r"aws\s+dynamodb\s+query",
+                r"aws\s+dynamodb\s+get-item",
+                r"aws\s+logs\s+filter-log-events",
+                r"aws\s+logs\s+describe-log-groups",
+                r"aws\s+logs\s+describe-log-streams",
+                r"aws\s+sts\s+get-caller-identity",
+                r"aws\s+ssm\s+get-parameter",
+                r"aws\s+ssm\s+get-parameters-by-path",
+                r"aws\s+lambda\s+get-function-url-config",
+            ]
+            if not any(re.match(pat, command) for pat in allowed_aws_patterns):
+                print(f"🚨 BLOCKED: {command}")
+                print("   Only read-only AWS CLI commands are allowed")
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": "Only read-only AWS CLI commands are allowed (describe/list/get). Mutations happen via CI/CD.",
+                    }
+                }
+
         # Block git init - creates nested repos that break commit tracking
         if first_word == "git":
             tokens = command.strip().split()
@@ -438,6 +550,18 @@ class SecurityValidator:
                     "permissionDecisionReason": error_reason,
                 }
             }
+
+        # Block Write tool from creating -result.txt files in screenshots/ directory
+        # (force use of backend-verify.cjs to produce these artifacts)
+        if tool_name in ["Write", "Edit", "MultiEdit"]:
+            write_path = tool_input.get("file_path", "")
+            if 'screenshots/' in write_path and write_path.endswith('-result.txt'):
+                print(f"🚨 BLOCKED {tool_name}: Cannot directly write -result.txt files")
+                return _deny_response(
+                    "Cannot directly create -result.txt files in screenshots/ directory. "
+                    "Use backend-verify.cjs to generate verification artifacts:\n"
+                    "  node backend-verify.cjs --test-id <ID> --output-dir <DIR> --command \"<CMD>\""
+                )
 
         # Additional validation for Edit/Write operations on tests.json
         if tool_name in ["Edit", "Write", "MultiEdit"]:
@@ -685,7 +809,105 @@ class SecurityValidator:
             return None  # Can't validate without project root
 
         # =====================================================================
-        # Check 1: Screenshot must exist
+        # Alternative path: Backend verification via backend-verify.cjs
+        # If a -result.txt file exists for this test, use that instead of
+        # requiring a screenshot — but ONLY for tests that explicitly declare
+        # a non-frontend category. Otherwise the agent could write a trivial
+        # backend-verify result (e.g. `--command "npx tsc --version"`) for a
+        # UI test and bypass the screenshot gate entirely.
+        # =====================================================================
+        result_file_pattern = f"{project_root}/screenshots/issue-{issue_number}/{test_id}-result.txt"
+        result_files = glob.glob(result_file_pattern)
+
+        test_category = _extract_test_category(file_path, test_id)
+
+        if result_files and test_category not in BACKEND_VERIFY_CATEGORIES:
+            # A result file exists but the test isn't eligible for the
+            # backend-verify path. Deny here rather than silently falling
+            # through to the screenshot path — a stray result.txt for a UI
+            # test is a strong signal of an attempted bypass.
+            print(
+                f"🚨 BLOCKED: Test '{test_id}' has a backend-verify result file "
+                f"but its category is '{test_category or 'unset'}'"
+            )
+            return _deny_response(
+                f"Test '{test_id}' has a backend-verify result file, but the "
+                f"backend-verify.cjs path is only allowed for tests whose "
+                f"\"category\" field in tests.json is one of: "
+                f"{', '.join(sorted(BACKEND_VERIFY_CATEGORIES))}.\n\n"
+                f"This test's category is "
+                f"'{test_category if test_category else 'unset'}'.\n\n"
+                f"If this is a frontend/UI test, verify it with a Playwright "
+                f"screenshot:\n"
+                f"  node playwright-test.cjs --url <URL> --test-id {test_id} "
+                f"--output-dir screenshots/issue-{issue_number} --operation full\n\n"
+                f"If this is a shared/infrastructure/backend test, add a "
+                f"\"category\" field to its tests.json entry, e.g. "
+                f'"category": "backend".'
+            )
+
+        if result_files:
+            # Backend verification path (category already validated above)
+            result_file = result_files[0]
+
+            # Check 1: Result file must have been viewed
+            if not was_screenshot_viewed(result_file):
+                print(f"🚨 BLOCKED: Result file exists for test '{test_id}' but not viewed")
+                return _deny_response(
+                    f"Result file exists for test '{test_id}' but you haven't verified it.\n\n"
+                    f"You must use the Read tool to view the result file:\n"
+                    f"  Read file: {result_file}\n\n"
+                    f"After viewing, also check the console log file."
+                )
+
+            # Check 2: Result file must contain sentinel
+            try:
+                result_content = Path(result_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return _deny_response(
+                    f"Cannot read result file for test '{test_id}': {result_file}"
+                )
+
+            if "VERIFIED_BY: backend-verify.cjs" not in result_content:
+                print(f"🚨 BLOCKED: Result file for test '{test_id}' missing sentinel")
+                return _deny_response(
+                    f"Result file for test '{test_id}' was not produced by backend-verify.cjs.\n"
+                    f"Use backend-verify.cjs to generate verification artifacts."
+                )
+
+            # Check 3: Result file must show PASS
+            if "RESULT: PASS" not in result_content:
+                print(f"🚨 BLOCKED: Test '{test_id}' result is FAIL")
+                return _deny_response(
+                    f"Cannot mark test '{test_id}' as passing — the verification result is FAIL.\n"
+                    f"Fix the issue and re-run backend-verify.cjs before marking as passing."
+                )
+
+            # Check 4: Console file must exist and be viewed
+            console_pattern = f"{project_root}/screenshots/issue-{issue_number}/{test_id}-console.txt"
+            console_files = glob.glob(console_pattern)
+
+            if not console_files:
+                print(f"🚨 BLOCKED: No console log found for test '{test_id}'")
+                return _deny_response(
+                    f"Cannot mark test '{test_id}' as passing. No console log file found.\n"
+                    f"backend-verify.cjs should have created this automatically."
+                )
+
+            console_viewed = any(was_screenshot_viewed(f) for f in console_files)
+            if not console_viewed:
+                print(f"🚨 BLOCKED: Console log exists for test '{test_id}' but not viewed")
+                return _deny_response(
+                    f"Console log exists for test '{test_id}' but you haven't verified it.\n\n"
+                    f"You must use the Read tool to view the console log:\n"
+                    f"  Read file: {console_files[0]}"
+                )
+
+            print(f"✅ Test '{test_id}' verified via backend-verify.cjs: result PASS and console log viewed")
+            return None  # Allow the edit
+
+        # =====================================================================
+        # Check 1: Screenshot must exist (frontend verification path)
         # =====================================================================
         screenshot_pattern = f"{project_root}/screenshots/issue-{issue_number}/{test_id}-*.png"
         screenshots = glob.glob(screenshot_pattern)

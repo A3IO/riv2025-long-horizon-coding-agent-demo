@@ -1,136 +1,213 @@
-# 🤖 Long-Horizon Coding Agent Demo
+# Long-Horizon Coding Agent Demo
 
-An autonomous agent system that builds React applications from GitHub issues using AWS Bedrock AgentCore and the Claude Agent SDK. Demonstrated at AWS re:Invent 2025.
+> [!IMPORTANT]
+> **This repository is archived.** It was built for the AWS re:Invent 2025 demo and is no longer maintained. The code is provided as-is for reference. No further updates, bug fixes, or security patches will be made, and issues and pull requests will not be reviewed.
+>
+> If you adapt this code, treat it as a starting point — not a production-ready template. In particular, review the IAM policies, the agent's command allowlist, and the test-verification gates against your own threat model before deploying to any account that holds real workloads or data.
 
-## How It Works
+An autonomous agent system that builds full-stack applications from GitHub issues using AWS Bedrock AgentCore and the Claude Agent SDK.
 
-### End-to-End Flow
-
-1. **User creates GitHub issue** with a feature request
-2. **Users vote** with 👍 reactions to prioritize what gets built
-3. **Authorized user approves** by adding a 🚀 reaction
-4. **Issue poller** (runs every 5 min) detects approved issues, sorted by votes
-5. **Agent builder** workflow acquires lock and invokes AWS Bedrock AgentCore
-6. **Bedrock entrypoint** clones the repo and starts the Claude agent
-7. **Agent builds the feature** following the build plan, taking screenshots, running tests
-8. **Progress is tracked** via commits pushed to the `agent-runtime` branch
-9. **Screenshots and updates are posted** to the GitHub issue
-10. **On completion**, the agent signals done, commits are pushed, and `agent-complete` label is added
-11. **If more issues exist**, the agent continues in enhancement mode
-12. **Deploy preview** workflow builds and deploys to CloudFront
-
-## Key Features
-
-- **Vote-based prioritization** - Issues with more 👍 reactions are built first
-- **Health monitoring** - CloudWatch heartbeat detects stale sessions and triggers auto-restart
-- **Incremental builds** - Agent builds new features on top of existing generated code
-- **Screenshot capture** - Playwright takes screenshots throughout development
-- **Live previews** - Each issue gets a CloudFront preview URL
-
-## Configuration
+## Quick Start
 
 ### Prerequisites
 
 - AWS account with Bedrock AgentCore access
 - GitHub repository with Actions enabled
-- Docker for local development
+- Docker installed locally
+- AWS CLI and CDK configured
+- `agentcore` CLI installed (`pip install bedrock-agentcore`) — **Note**: the `agentcore launch/push/build` subcommands are broken; use `make` targets instead (see below)
 
-### AWS Configuration
+### Deployment Steps
 
-1. Copy `.bedrock_agentcore.yaml.template` to `.bedrock_agentcore.yaml`
-2. Fill in your AWS values:
-
-| Value | Description | Example |
-|-------|-------------|---------|
-| `YOUR_ACCOUNT_ID` | Your AWS account ID | `123456789012` |
-| `YOUR_EXECUTION_ROLE` | IAM role for AgentCore runtime | `AmazonBedrockAgentCoreSDKRuntime-...` |
-| `YOUR_PROJECT_NAME` | ECR repository name | `my-agent` |
-| `YOUR_AGENT_RUNTIME_ID` | AgentCore runtime ID (after first deploy) | `my_agent-abc123` |
-| `YOUR_CODEBUILD_ROLE` | IAM role for CodeBuild | `AmazonBedrockAgentCoreSDKCodeBuild-...` |
-
-### GitHub Repository Secrets
-
-Configure in Settings → Secrets and variables → Actions → Secrets:
-
-| Secret | Description |
-|--------|-------------|
-| `AWS_ACCESS_KEY_ID` | IAM user access key for GitHub Actions |
-| `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
-| `AWS_AGENTCORE_ROLE_ARN` | IAM role ARN for invoking AgentCore |
-| `AWS_PREVIEW_DEPLOY_ROLE_ARN` | IAM role ARN for deploying previews |
-
-### GitHub Repository Variables
-
-Configure in Settings → Secrets and variables → Actions → Variables:
-
-| Variable | Description |
-|----------|-------------|
-| `AUTHORIZED_APPROVERS` | Comma-separated GitHub usernames who can approve builds with 🚀 |
-| `PREVIEWS_BUCKET_NAME` | S3 bucket for preview deployments |
-| `PREVIEWS_CDN_DOMAIN` | CloudFront domain for previews |
-| `PREVIEWS_DISTRIBUTION_ID` | CloudFront distribution ID for cache invalidation |
-
-### GitHub Repository Labels
-
-The following labels must exist for the workflows to function properly:
-
-| Label | Color | Description |
-|-------|-------|-------------|
-| `agent-building` | `#FBCA04` (yellow) | Agent is actively working on this issue |
-| `agent-complete` | `#0E8A16` (green) | Agent has completed this issue |
-| `tests-failed` | `#D93F0B` (red) | Tests failed during agent build |
-
-Create these at Settings → Labels, or via CLI:
 ```bash
-gh api repos/OWNER/REPO/labels -f name="agent-building" -f color="FBCA04" -f description="Agent is actively working on this issue"
-gh api repos/OWNER/REPO/labels -f name="agent-complete" -f color="0E8A16" -f description="Agent has completed this issue"
-gh api repos/OWNER/REPO/labels -f name="tests-failed" -f color="D93F0B" -f description="Tests failed during agent build"
+# 0. Copy and fill in your local config
+cp Makefile.local.example Makefile.local
+# Edit Makefile.local: set AWS_PROFILE, AWS_REGION, VPC_ID, GITHUB_REPO
+
+# 1. Deploy CDK infrastructure (ECR, S3 buckets, CloudFront, IAM roles)
+make deploy-infra
+
+# 2. Build and push the Docker image (ECR URI from: make show-config)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ECR_URI>
+docker build --platform linux/arm64 -t <ECR_URI>:latest .
+docker push <ECR_URI>:latest
+
+# 3. Create the AgentCore runtime (first time only)
+make create-runtime
+# Copy the agentRuntimeId from the output into Makefile.local as AGENT_RUNTIME_ID
+# Then update the runtime environment:
+make update-runtime-env
 ```
+
+### GitHub Setup
+
+1. **Secrets** (Settings > Secrets and variables > Actions > Secrets):
+
+   | Secret | Description |
+   |--------|-------------|
+   | `AWS_ACCESS_KEY_ID` | IAM user access key for GitHub Actions |
+   | `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
+   | `AWS_AGENTCORE_ROLE_ARN` | IAM role ARN for invoking AgentCore (output of CDK deploy) |
+   | `AWS_PREVIEW_DEPLOY_ROLE_ARN` | IAM role ARN for deploying previews (output of CDK deploy) |
+   | `AWS_INFRA_DEPLOY_ROLE_ARN` | IAM role ARN for deploying agent-written CDK infra (output of CDK deploy) |
+
+2. **Variables** (Settings > Secrets and variables > Actions > Variables):
+
+   | Variable | Description |
+   |----------|-------------|
+   | `AUTHORIZED_APPROVERS` | Comma-separated GitHub usernames who can approve builds |
+   | `AWS_REGION` | AWS region where infrastructure is deployed (e.g. `us-east-1`) |
+   | `AGENTCORE_AGENT_ID` | AgentCore runtime ID (from `make create-runtime` output) |
+   | `APP_CDK_STACK_NAME` | CDK stack name for agent-generated app (e.g. `canopy-app-stack`) |
+   | `PREVIEWS_BUCKET_NAME` | S3 bucket for preview deployments (output of CDK deploy) |
+   | `PREVIEWS_CDN_DOMAIN` | CloudFront domain for previews (output of CDK deploy) |
+   | `PREVIEWS_DISTRIBUTION_ID` | CloudFront distribution ID for cache invalidation (output of CDK deploy) |
+
+3. **Labels** (must exist for workflows):
+
+   ```bash
+   gh api repos/OWNER/REPO/labels -f name="agent-building" -f color="FBCA04" -f description="Agent is actively working on this issue"
+   gh api repos/OWNER/REPO/labels -f name="agent-complete" -f color="0E8A16" -f description="Agent has completed this issue"
+   gh api repos/OWNER/REPO/labels -f name="tests-failed" -f color="D93F0B" -f description="Tests failed during agent build"
+   ```
 
 ### AWS Secrets Manager
 
-The agent reads secrets from AWS Secrets Manager. Required secrets:
+The agent reads secrets at runtime:
 
 | Secret Name | Description |
 |-------------|-------------|
-| `claude-code/{env}/anthropic-api-key` | Anthropic API key for Claude |
+| `claude-code/{env}/anthropic-api-key` | Anthropic API key (not needed if using Bedrock) |
 | `claude-code/{env}/github-token` | Default GitHub PAT (fallback) |
 | `claude-code/{env}/github-token-{org}` | Org-specific GitHub PAT (optional) |
 
-Where `{env}` is the environment name (default: `reinvent`) and `{org}` is the GitHub organization name.
+Where `{env}` is the environment name (default: `reinvent`).
 
-**Org-specific tokens** allow separation of concerns when working with multiple GitHub organizations. The agent checks for an org-specific token first, then falls back to the default:
+## How It Works
+
+1. **User creates a GitHub issue** with a feature request
+2. **Users vote** with reactions to prioritize what gets built
+3. **Authorized user approves** by adding a reaction
+4. **Issue poller** (runs every 5 min) detects approved issues, sorted by votes
+5. **Agent builder** workflow acquires lock and invokes AWS Bedrock AgentCore
+6. **Bedrock entrypoint** clones the repo and starts the Claude agent
+7. **Agent builds the feature** following the build plan, taking screenshots, running tests
+8. **Progress is tracked** via commits pushed to the `agent-runtime` branch
+9. **On completion**, the `agent-complete` label is added
+10. **Deploy preview** workflow builds and deploys to CloudFront
+
+## Creating a New Project
+
+> **Recommended**: Run `claude` in this repo for an interactive guided setup. Claude will check your prerequisites, help you create a BUILD_PLAN.md, deploy infrastructure, and trigger the agent — all conversationally.
+
+The agent uses `PROJECT_NAME` to find build plans and configure each project. To build something other than the default Canopy app:
+
+### 1. Create a build plan directory
+
+```
+prompts/
+  myapp/
+    BUILD_PLAN.md         # Required: full project specification
+    EXAMPLE_TEST.txt      # Optional: example test for the agent to follow
+    DEBUGGING_GUIDE.md    # Optional: project-specific debugging tips
+```
+
+### 2. Write BUILD_PLAN.md
+
+This is the most important file. It tells the agent exactly what to build. Include:
+
+- **Project overview** — what the app does, who it's for
+- **Technology stack** — framework, build tools, styling, backend
+- **API specification** — endpoints, request/response schemas
+- **Data models** — entities, relationships, database design
+- **UI specification** — pages, components, layout
+- **Test requirements** — what tests to write, how to run them
+
+See `prompts/canopy/BUILD_PLAN.md` for a complete example.
+
+### 3. Launch with your project name
 
 ```bash
-# Create org-specific token (recommended for multi-org setups)
-aws secretsmanager create-secret \
-  --name claude-code/reinvent/github-token-anthropics \
-  --secret-string "ghp_your_pat_here" \
-  --region us-west-2
+# Via make
+make launch PROJECT_NAME=myapp
 
-# Or update existing default token
-aws secretsmanager update-secret \
-  --secret-id claude-code/reinvent/github-token \
-  --secret-string "ghp_your_pat_here" \
-  --region us-west-2
+# Or override just the variable
+make launch-local PROJECT_NAME=myapp
 ```
+
+### What PROJECT_NAME controls
+
+- `prompts/{PROJECT_NAME}/BUILD_PLAN.md` is loaded as the build plan
+- `prompts/{PROJECT_NAME}/EXAMPLE_TEST.txt` is loaded as test guidance
+- `prompts/{PROJECT_NAME}/DEBUGGING_GUIDE.md` is loaded for debugging context
+- Shared prompts in `prompts/system_prompt.txt` and `prompts/DEBUGGING_GUIDE.md` are always loaded
+
+## Resetting the Agent
+
+To wipe all agent state and start fresh:
+
+```bash
+make reset
+```
+
+This performs the following:
+
+1. **Deletes the `agent-runtime` branch** (local and remote) — removes all generated code
+2. **Closes all open issues** with the `agent-building` label
+3. **Clears SSM parameters** — `/claude-code/current-issue`, `/claude-code/session-id`, `/claude-code/infra/deploy-state`
+4. **Empties S3 buckets** — screenshots and previews
+5. **Invalidates CloudFront caches** — ensures stale content is purged
+
+After reset, create a new GitHub issue and add a reaction to trigger a fresh build.
+
+## Configuration
+
+Override any variable on the command line:
+
+```bash
+make launch PROJECT_NAME=myapp SESSION_DURATION_HOURS=2.0 DEFAULT_MODEL=us.anthropic.claude-opus-4-6-v1
+```
+
+Key variables (set in `Makefile` or via environment):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROJECT_NAME` | `canopy` | Which build plan to use (`prompts/{name}/`) |
+| `DEFAULT_MODEL` | `us.anthropic.claude-opus-4-6-v1` | Bedrock model ID |
+| `SESSION_DURATION_HOURS` | `7.0` | Max agent session length |
+| `PUSH_INTERVAL_SECONDS` | `300` | How often to push commits |
+| `SCREENSHOT_INTERVAL_SECONDS` | `300` | How often to capture screenshots |
+| `AWS_PROFILE` | `default` | AWS CLI profile |
+| `AWS_REGION` | `us-east-1` | AWS region |
+| `GITHUB_REPO` | _(set in Makefile.local)_ | Target GitHub repo (owner/repo) |
+
+Run `make show-config` to see all current values.
 
 ## Project Structure
 
 ```
-├── bedrock_entrypoint.py    # Main orchestrator for AWS Bedrock AgentCore
-├── claude_code.py           # Agent session manager and local runner
-├── src/                     # Python modules
-│   ├── cloudwatch_metrics.py  # Heartbeat and metrics
-│   ├── github_integration.py  # GitHub API operations
-│   └── git_operations.py      # Git commit/push logic
-├── prompts/                 # Build plans and system prompts
-│   └── canopy/              # Project Management app build plan
-├── frontend-scaffold-template/  # React + Vite + Tailwind scaffold
-└── .github/workflows/       # GitHub Actions
-    ├── issue-poller.yml     # Polls for approved issues
-    ├── agent-builder.yml    # Invokes AgentCore
-    └── deploy-preview.yml   # Deploys to CloudFront
+├── bedrock_entrypoint.py           # Main orchestrator — clones repo, starts agent
+├── claude_code.py                  # Agent session manager (Claude SDK wrapper)
+├── src/
+│   ├── cloudwatch_metrics.py       # Heartbeat and metrics
+│   ├── github_integration.py       # GitHub API operations
+│   └── git_operations.py           # Git commit/push logic
+├── prompts/
+│   ├── system_prompt.txt           # Shared system prompt (all projects)
+│   ├── DEBUGGING_GUIDE.md          # Shared debugging tips
+│   ├── FRONTEND_AESTHETICS_GUIDE.md # UI design guidance
+│   └── canopy/                     # Canopy project build plan
+│       ├── BUILD_PLAN.md
+│       ├── EXAMPLE_TEST.txt
+│       ├── DEBUGGING_GUIDE.md
+│       └── system_prompt.txt
+├── frontend-scaffold-template/     # React + Vite + Tailwind scaffold
+├── infrastructure/                 # CDK stack (ECR, S3, CloudFront, IAM)
+├── .github/workflows/
+│   ├── issue-poller.yml            # Polls for approved issues
+│   ├── agent-builder.yml           # Invokes AgentCore
+│   └── deploy-preview.yml          # Deploys built app to CloudFront
+└── Makefile                        # All management commands
 ```
 
 ## License

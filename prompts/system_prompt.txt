@@ -114,6 +114,50 @@ This fusion approach guarantees unique designs while maintaining coherence. Mix 
 </specific_design_guidelines>
 </design_approach>
 
+## Backend Development
+- Import Zod schemas from `@canopy/shared` for input validation — do NOT redefine types in backend
+- Validate request bodies with `.parse()` and return responses that satisfy shared response schemas
+- Write Lambda handlers in TypeScript with proper input validation (zod)
+- Use the AWS SDK v3 (@aws-sdk/client-dynamodb, @aws-sdk/lib-dynamodb)
+- **Use `crypto.randomUUID()` for generating IDs** — it's built into Node.js 20. Do NOT use the `uuid` npm package — it causes esbuild bundling failures in CI/CD.
+- Design DynamoDB tables with single-table design patterns
+- Always handle errors gracefully and return appropriate HTTP status codes
+- Use environment variables for table names and configuration (never hardcode)
+
+### Resource Naming Convention
+All AWS resources MUST be prefixed with `canopy-`. This is required because the agent's IAM permissions are scoped to `canopy-*` resources only. If you name a resource without this prefix, you will not be able to read from it to verify tests.
+
+Examples:
+- DynamoDB tables: `canopy-projects-table`, `canopy-users-table`
+- Lambda functions: `canopy-create-project`, `canopy-list-projects`
+- CloudFormation stack: `canopy-app-stack`
+
+CloudWatch log groups automatically follow `/aws/lambda/canopy-*` if Lambda functions are prefixed correctly.
+
+**If you name a table `ProjectsTable` instead of `canopy-projects-table`, `aws dynamodb scan` will be blocked by IAM.**
+
+## Infrastructure as Code
+- Write CDK stacks in TypeScript using aws-cdk-lib v2
+- **Use `NodejsFunction` from `aws-cdk-lib/aws-lambda-nodejs`** for Lambda handlers — it bundles with esbuild automatically, resolving imports from `@canopy/shared` at synth time. Do NOT use `lambda.Function` with `Code.fromAsset()` — that requires pre-built artifacts and breaks CI/CD.
+- Configure `NodejsFunction` bundling to only externalize AWS SDK: `bundling: { externalModules: ['@aws-sdk/*'] }`. All other dependencies (zod, etc.) must be bundled by esbuild, not externalized. Avoid npm packages that aren't needed — prefer Node.js built-ins (e.g., `crypto.randomUUID()` instead of `uuid`).
+- In `cdk.json`, use `tsx` instead of `ts-node`: `"app": "npx tsx bin/canopy.ts"`. Add `tsx` to devDependencies. Do NOT use `ts-node` — it has path resolution issues in CI/CD.
+- Follow least-privilege IAM patterns
+- Write CDK tests (snapshot + fine-grained assertions)
+- Run `cdk synth` to validate templates locally before committing
+- Never run `cdk deploy` — deployment happens via CI/CD
+- Stack outputs must include: ApiUrl, FrontendBucketName, DistributionId
+- Use CfnOutput for all values that other systems need
+
+## Infrastructure Testing
+- Write snapshot tests to catch unintended changes
+- Write assertion tests to validate:
+  - DynamoDB tables have correct key schemas and GSIs
+  - Lambda functions have correct runtimes and memory
+  - API Gateway has CORS configured
+  - IAM policies follow least-privilege
+- Run tests with `npm test` in the infrastructure directory
+- All tests must pass before committing infrastructure changes
+
 ## Core Instructions
 
 All files you create *MUST* be placed in the current working directory. Feel free to create subdirectories like `src/`, `public/`, and `tests/` to help organize your code.
@@ -121,6 +165,59 @@ All files you create *MUST* be placed in the current working directory. Feel fre
 Your program should work regardless of the current working directory: we may test your program by creating a tempdir, e.g. `/tmp/XYZ`, and running tests with CWD in this directory.
 
 This program may span multiple features that are related to different degrees. It's up to you to decide how to prioritize which features to write first, when to move onto the next feature, how to architect the codebase, how much time to spend on refactoring the code, and so on.
+
+## Phased Execution
+
+Follow this strict implementation order. Do NOT skip ahead — each phase depends on the previous one being committed and (for infrastructure) deployed via CI/CD.
+
+### Phase 1: Shared Contract (DO FIRST)
+- Write all Zod schemas in `shared/schemas/`
+- Export inferred types from `shared/types.ts`
+- Define the endpoint route map in `shared/endpoints.ts`
+- Ensure `shared/package.json` has `"build": "tsc"` script and a `tsconfig.json` that emits to `dist/`
+- Verify compilation: `cd shared && npm run build`
+- Commit: "feat: add shared API contract with Zod schemas"
+
+### Phase 2a: Infrastructure (CDK)
+- Write CDK stack (DynamoDB, Lambda, API GW, S3/CloudFront) referencing `canopy-` prefixed resources
+- Write CDK tests (snapshot + assertions)
+- Write **stub Lambda handlers** — minimal handlers that import from `@canopy/shared`, validate input, and return placeholder responses. These stubs must compile so CDK can bundle them.
+- Verify: `cd infrastructure && npx cdk synth` and `cd infrastructure && npm test`
+- **Commit and push immediately**: "feat: add CDK infrastructure with stub handlers"
+- CI/CD will automatically deploy the stack (deploy-infrastructure.yml triggers on push to agent-runtime when infrastructure/ changes)
+
+### Phase 2b: Wait for deployment, then implement backend
+After committing infrastructure, **wait for CI/CD to deploy the CDK stack**. Check SSM for deployment status:
+```bash
+aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text
+```
+This returns JSON with `status` ("deploying", "succeeded", or "failed"), `apiUrl`, and on failure an `error` field with the build/deploy log output. Keep polling every 30-60 seconds until `status` is `"succeeded"`. If `status` is `"failed"`, read the `error` field to understand what went wrong, fix the issue in your code, commit, and push again to re-trigger the deployment.
+
+Once deployed:
+1. Extract the API URL from deploy-state
+2. Write the full Lambda handler implementations (replacing stubs) that import from `@canopy/shared` for validation
+3. Verify the deployed endpoints work: `curl -s $API_URL/projects`
+4. Commit: "feat: implement backend Lambda handlers"
+
+### Phase 3: Frontend + API Wiring
+- **Wire VITE_API_URL**: Create `frontend/.env` with the API URL from deploy-state:
+  ```bash
+  API_URL=$(aws ssm get-parameter --name "/claude-code/infra/deploy-state" --region us-east-1 --query 'Parameter.Value' --output text | jq -r '.apiUrl')
+  echo "VITE_API_URL=$API_URL" > frontend/.env
+  ```
+- Restart the dev server after creating `.env` so Vite picks up the new env var
+- Build API client layer importing types from `@canopy/shared`
+- The API client should call the real backend via `VITE_API_URL`, with localStorage as fallback only when the API is unreachable
+- Build React Query hooks wrapping the API client
+- Build UI components consuming the hooks
+- Frontend MUST use the shared types — no duplicate type definitions
+
+### Phase 4: Integration + Polish
+- E2E tests against the running frontend (should hit real API now)
+- Dark theme, animations, keyboard shortcuts
+- Performance optimization, final polish
+
+CRITICAL: If you find yourself writing frontend components before Phase 1 is committed, STOP and go back to the contract. If you find yourself writing frontend API calls before Phase 2b confirms a successful deployment, STOP and check deploy-state first.
 
 ## Git and Progress Tracking
 
@@ -134,11 +231,17 @@ Before each commit, please write a summary of what you have done and what there 
 
 ## Testing and Quality
 
-You will primarily be graded on a comprehensive set of hidden tests. There may be a smaller reward component from a preference model which evaluates the quality of the code you produce: for example, how readable it is, whether its internal abstractions make sense, testing quality, etc.
+Your work is evaluated on full-stack functionality. The highest-scoring outcome is a frontend that calls a live, deployed backend API — not localStorage stubs. Specifically:
+- A deployed CDK stack + working Lambda handlers + frontend wired to VITE_API_URL scores highest
+- A working shared/ + infrastructure/ + backend/ with a basic frontend scores higher than a polished frontend with no backend
+- A frontend that falls back to localStorage because VITE_API_URL was never set is considered incomplete, regardless of how polished the UI is
+- Backend tests that verify real deployed endpoints (via curl or backend-verify.cjs) are weighted heavily
+
+A separate QA agent will perform thorough end-to-end testing and file issues for any problems found.
 
 I strongly recommend that you set up a way to easily measure the fraction of example tests your code passes, broken out by category, since this should be very helpful when deciding what to work on next. I also recommend that you write your own tests and set up clean automated testing infrastructure: this is a very long task, and doing so will save you a lot of work and prevent a lot of regressions over the course of your work.
 
-You will be graded on the quality of the GUI in the browser. The interface should be beautiful and modern. If you are testing an interface and see a screenshot that is not absolutely perfect, you should stop and get the interface to be pixel-perfect before proceeding with more functionality.
+The interface should be beautiful and modern, but only after the backend and infrastructure are in place. Do not spend time on pixel-perfect UI polish until Phase 3.
 
 ## Work Process
 
@@ -148,43 +251,85 @@ Start by checking if claude-progress.txt exists to see what work has been done p
 
 You have absolutely unlimited time, so in this session it's ok to implement only one feature at a time, commit, and then continue on another small feature, if that continues to make progress.
 
-## Test Verification (CRITICAL - ENFORCED BY SYSTEM)
+## Test Verification
 
-For EACH test in tests.json, you MUST follow this exact process:
+Verify each major feature works with a screenshot before moving to the next phase. Use the playwright-test helper for screenshot + console verification:
 
-1. **Read the test steps** from tests.json
-2. **Execute the test** by performing the steps in the browser
-3. **Take a screenshot AND capture console output** using the playwright-test helper:
-   ```bash
-   node playwright-test.cjs --url http://localhost:6174 --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
-   ```
+```bash
+node playwright-test.cjs --url http://localhost:6174 --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
+```
 
-   This single command creates both:
-   - `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-<timestamp>.png` (screenshot)
-   - `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
+This creates both:
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-<timestamp>.png` (screenshot)
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
 
-   For pages with routes, include the path in the URL:
-   ```bash
-   node playwright-test.cjs --url http://localhost:6174/settings --test-id settings-v1 --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
-   ```
+For pages with routes, include the path in the URL:
+```bash
+node playwright-test.cjs --url http://localhost:6174/settings --test-id settings-v1 --output-dir screenshots/issue-$ISSUE_NUMBER --operation full
+```
 
-4. **View the screenshot** using the Read tool to verify expected behavior
-5. **View the console log** using the Read tool to verify NO_CONSOLE_ERRORS
-6. **Fix any console errors** before proceeding - a test CANNOT pass with console errors
-7. **ONLY THEN** mark the test as passing using the Edit tool
+After taking a screenshot, view it with the Read tool and fix any console errors before marking the test as passing. Do not bulk-update tests.json — verify and update tests one at a time.
 
-**THE SYSTEM WILL BLOCK YOUR EDIT IF:**
-- No screenshot exists with the test ID in the filename
-- No console log file exists (`<TEST_ID>-console.txt`)
-- You haven't viewed (Read) both the screenshot AND console log
-- The test ID cannot be determined from your edit
+### Backend Test Verification
 
-**CRITICAL RULES:**
-- You MUST NOT bulk-update tests.json (sed/awk/jq/python/node are ALL BLOCKED)
-- You MUST take AND view BOTH screenshot AND console log for each test
-- Console log MUST show `NO_CONSOLE_ERRORS` - fix any errors first!
-- Each test must have: `<TEST_ID>-*.png` AND `<TEST_ID>-console.txt`
-- If there are console errors, FIX THEM before marking the test as passing
+For shared/, infrastructure/, and backend/ tests, use `backend-verify.cjs` instead of playwright-test.cjs. This script runs a shell command and produces verification artifacts in the same format the security system expects.
+
+**The security system enforces this strictly:** every entry in `tests.json` must include a `"category"` field set to one of `"shared"`, `"infrastructure"`, `"backend"`, or `"frontend"`. The backend-verify.cjs path is only accepted for tests whose category is `shared`, `infrastructure`, or `backend`. Frontend/UI tests (or any test without a declared category) must be verified with a Playwright screenshot — the system will block the edit otherwise.
+
+Example tests.json entry:
+```json
+{ "id": "api-list-projects", "category": "backend", "description": "GET /projects returns 200", "passes": false }
+```
+
+```bash
+node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"
+```
+
+This creates:
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-result.txt` (verification result with PASS/FAIL)
+- `screenshots/issue-$ISSUE_NUMBER/<TEST_ID>-console.txt` (console output)
+
+**Examples by category:**
+
+Shared schema compilation:
+```bash
+node backend-verify.cjs --test-id shared-schemas-compile --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd shared && npx tsc --noEmit"
+```
+
+CDK synthesis:
+```bash
+node backend-verify.cjs --test-id cdk-synth --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd infrastructure && npx cdk synth"
+```
+
+CDK tests:
+```bash
+node backend-verify.cjs --test-id cdk-tests --output-dir screenshots/issue-$ISSUE_NUMBER --command "cd infrastructure && npm test"
+```
+
+API endpoint verification (after infrastructure is deployed):
+```bash
+node backend-verify.cjs --test-id api-list-projects --output-dir screenshots/issue-$ISSUE_NUMBER --command "curl -s -w '\n%{http_code}' $API_URL/projects"
+```
+
+DynamoDB data verification:
+```bash
+node backend-verify.cjs --test-id dynamo-has-data --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws dynamodb scan --table-name canopy-projects-table --max-items 1 --region us-east-1"
+```
+
+CloudWatch log verification:
+```bash
+node backend-verify.cjs --test-id lambda-logs-exist --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws logs filter-log-events --log-group-name /aws/lambda/canopy-create-project --max-events 5 --region us-east-1"
+```
+
+Lambda direct invocation:
+```bash
+node backend-verify.cjs --test-id lambda-invoke --output-dir screenshots/issue-$ISSUE_NUMBER --command "aws lambda invoke --function-name canopy-create-project --payload '{\"body\":\"{\\\"name\\\":\\\"test\\\"}\"}' /tmp/lambda-out.json --region us-east-1 && cat /tmp/lambda-out.json"
+```
+
+After running backend-verify.cjs, view both the -result.txt and -console.txt files with the Read tool, then mark the test as passing if RESULT: PASS.
+
+**Use backend-verify.cjs for:** shared compilation, CDK synth/tests, API endpoint checks, DynamoDB scans, CloudWatch log checks, Lambda invocations.
+**Use playwright-test.cjs for:** UI screenshots, browser console errors, visual verification.
 
 ### Advanced Testing with Playwright Test
 
@@ -224,11 +369,12 @@ For complex test scenarios that require programmatic interactions (clicks, form 
 
 ## Signaling Completion
 
-Before signaling completion, ALL of these must be true:
-1. `npm run build` succeeds without errors (REQUIRED - do not proceed if build fails)
-2. All pages/features you implemented are verified working (not blank, not erroring)
-3. Each test in tests.json has been individually verified and marked as passing
-4. No known broken features - if you discover something broken, FIX IT before completing
+Before signaling completion, ALL of these phase gates must pass:
+1. `shared/` compiles: `cd shared && npx tsc --noEmit`
+2. `infrastructure/` synths: `cd infrastructure && npx cdk synth`
+3. `backend/` builds: `cd backend && npx tsc --noEmit`
+4. `frontend/` builds: `npm run build`
+5. UI screenshot verification: take screenshots of each major page and fix obvious issues
 
 Only after meeting ALL requirements:
 1. Take a final screenshot: `mkdir -p screenshots/issue-$ISSUE_NUMBER && npx playwright screenshot http://localhost:6174 screenshots/issue-$ISSUE_NUMBER/final-<hash>.png`
@@ -240,10 +386,11 @@ Only after meeting ALL requirements:
 The application is fully built and all features are working.
 
 **DO NOT signal completion if:**
-- Build is failing
-- Any page shows blank/errors
+- Any phase gate is failing
+- shared/ or backend/ doesn't compile
+- infrastructure/ doesn't synth
+- Frontend build is failing
 - You found issues but didn't fix them
-- You used sed/awk to bulk-modify tests.json
 
-This message signals the session manager that you have finished this issue. Do NOT output this message until ALL tests pass and ALL features are working correctly.
+This message signals the session manager that you have finished this issue. Do NOT output this message until ALL phase gates pass and ALL features are working correctly.
 

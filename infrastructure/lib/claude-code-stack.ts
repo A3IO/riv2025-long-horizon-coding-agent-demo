@@ -40,20 +40,34 @@ export class ClaudeCodeStack extends cdk.Stack {
 
     const { projectName, environment, logRetentionDays } = props;
 
+    // AgentCore execution role name - set via CDK context
+    // Find yours with: aws iam list-roles --query "Roles[?contains(RoleName,'AgentCore')].RoleName"
+    // Pass via: cdk deploy -c agentCoreRoleName=AmazonBedrockAgentCoreSDKRuntime-us-east-1-xxxxx
+    // Leave unset on first deploy (before AgentCore is created); redeploy after creating the runtime.
+    const agentCoreRoleName = this.node.tryGetContext('agentCoreRoleName') || '';
+
+    // App name used to scope backend test policies to the agent-generated app stack.
+    // Defaults to 'canopy'; override with: cdk deploy -c appName=myapp
+    const appName = this.node.tryGetContext('appName') || 'canopy';
+
     // ========================================================================
     // VPC - Required for EFS
+    // Import existing VPC via context, or create a new one
     // ========================================================================
-    const vpc = new ec2.Vpc(this, 'VPC', {
-      maxAzs: 2,
-      natGateways: 0,
-      subnetConfiguration: [
-        {
-          name: 'Public',
-          subnetType: ec2.SubnetType.PUBLIC,
-          cidrMask: 24,
-        },
-      ],
-    });
+    const existingVpcId = this.node.tryGetContext('vpcId') || '';
+    const vpc = existingVpcId
+      ? ec2.Vpc.fromLookup(this, 'VPC', { vpcId: existingVpcId })
+      : new ec2.Vpc(this, 'VPC', {
+          maxAzs: 2,
+          natGateways: 0,
+          subnetConfiguration: [
+            {
+              name: 'Public',
+              subnetType: ec2.SubnetType.PUBLIC,
+              cidrMask: 24,
+            },
+          ],
+        });
 
     // ========================================================================
     // ECR Repository - Stores agent container image (used by AgentCore)
@@ -121,30 +135,8 @@ export class ClaudeCodeStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // ========================================================================
-    // AWS Backup - Daily EFS snapshots
-    // ========================================================================
-    const backupVault = new backup.BackupVault(this, 'BackupVault', {
-      backupVaultName: `${projectName}-${environment}-vault`,
-    });
-
-    const backupPlan = new backup.BackupPlan(this, 'BackupPlan', {
-      backupPlanName: `${projectName}-${environment}-daily`,
-      backupPlanRules: [
-        new backup.BackupPlanRule({
-          ruleName: 'DailyBackup',
-          scheduleExpression: cdk.aws_events.Schedule.cron({
-            hour: '2',
-            minute: '0',
-          }),
-          deleteAfter: cdk.Duration.days(35),
-        }),
-      ],
-    });
-
-    backupPlan.addSelection('EfsBackupSelection', {
-      resources: [backup.BackupResource.fromEfsFileSystem(fileSystem)],
-    });
+    // AWS Backup - Daily EFS snapshots (disabled for initial setup, enable later)
+    // EFS has automatic backups enabled via enableAutomaticBackups: true above
 
     // ========================================================================
     // IAM Role for AgentCore Invocation (GitHub Actions)
@@ -174,7 +166,7 @@ export class ClaudeCodeStack extends cdk.Stack {
         'bedrock-agentcore:StopRuntimeSession',
       ],
       resources: [
-        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/antodo_agent-0UyfaL5NVq`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/*`,
         '*',
       ],
     }));
@@ -206,67 +198,187 @@ export class ClaudeCodeStack extends cdk.Stack {
 
     // ========================================================================
     // AgentCore Execution Role - Grant Secrets & CloudWatch Access
+    // Only created when agentCoreRoleName is provided (after AgentCore runtime exists)
+    // Redeploy with: cdk deploy -c agentCoreRoleName=<your-role-name>
     // ========================================================================
-    const agentCoreSecretsPolicy = new iam.ManagedPolicy(this, 'AgentCoreSecretsPolicy', {
-      // Let CDK auto-generate name to avoid replacement conflicts
-      description: 'Allows AgentCore execution role to read claude-code secrets and manage SSM parameters',
-      statements: [
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: ['secretsmanager:GetSecretValue'],
-          resources: [
-            `arn:aws:secretsmanager:${this.region}:${this.account}:secret:claude-code/*`,
-          ],
-        }),
-        // SSM Parameter Store write/delete access for session health tracking
-        // AgentCore writes current issue number for health monitor to read
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:GetParameter'],
-          resources: [
-            `arn:aws:ssm:${this.region}:${this.account}:parameter/claude-code/*`,
-          ],
-        }),
-      ],
-      roles: [
-        iam.Role.fromRoleName(
-          this,
-          'AgentCoreExecutionRole',
-          'AmazonBedrockAgentCoreSDKRuntime-us-west-2-f3ae55dcc2'
-        ),
-      ],
-    });
+    if (agentCoreRoleName) {
+      new iam.ManagedPolicy(this, 'AgentCoreSecretsPolicy', {
+        description: 'Allows AgentCore execution role to read claude-code secrets and manage SSM parameters',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['secretsmanager:GetSecretValue'],
+            resources: [
+              `arn:aws:secretsmanager:${this.region}:${this.account}:secret:claude-code/*`,
+            ],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:GetParameter'],
+            resources: [
+              `arn:aws:ssm:${this.region}:${this.account}:parameter/claude-code/*`,
+            ],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRole', agentCoreRoleName),
+        ],
+      });
 
-    // CloudWatch metrics policy for AgentCore runtime
-    new iam.ManagedPolicy(this, 'AgentCoreCloudWatchPolicy', {
-      // Let CDK auto-generate name to avoid replacement conflicts
-      description: 'Allows AgentCore execution role to push CloudWatch metrics',
-      statements: [
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: ['cloudwatch:PutMetricData'],
-          resources: ['*'],
-          conditions: {
-            StringEquals: {
-              'cloudwatch:namespace': 'ClaudeCodeAgent',
+      new iam.ManagedPolicy(this, 'AgentCoreInfraReadPolicy', {
+        description: 'Allows AgentCore execution role to verify infrastructure deployments (read-only)',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'cloudformation:DescribeStacks', 'cloudformation:ListStacks',
+              'apigateway:GET', 'apigatewayv2:GetApis',
+              'lambda:GetFunction', 'lambda:ListFunctions',
+              'dynamodb:DescribeTable', 'dynamodb:ListTables',
+            ],
+            resources: ['*'],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForInfra', agentCoreRoleName),
+        ],
+      });
+
+      new iam.ManagedPolicy(this, 'AgentCoreBackendTestPolicy', {
+        description: 'Allows AgentCore execution role to read DynamoDB, CloudWatch Logs, and invoke Lambda for backend test verification',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:GetItem', 'dynamodb:BatchGetItem',
+            ],
+            resources: [
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/${appName}-*`,
+              `arn:aws:dynamodb:${this.region}:${this.account}:table/${appName}-*/index/*`,
+            ],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'logs:FilterLogEvents', 'logs:GetLogEvents',
+              'logs:DescribeLogGroups', 'logs:DescribeLogStreams',
+            ],
+            resources: [
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/${appName}-*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/lambda/${appName}-*:*`,
+            ],
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['lambda:InvokeFunction'],
+            resources: [
+              `arn:aws:lambda:${this.region}:${this.account}:function:${appName}-*`,
+            ],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForBackendTest', agentCoreRoleName),
+        ],
+      });
+
+      new iam.ManagedPolicy(this, 'AgentCoreBedrockInvokePolicy', {
+        description: 'Allows AgentCore execution role to invoke Bedrock models and cross-region inference profiles',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
+            resources: [
+              // Standard foundation models (any region)
+              `arn:aws:bedrock:*::foundation-model/anthropic.*`,
+              // Cross-region inference profiles (us.anthropic.* prefix)
+              `arn:aws:bedrock:*::foundation-model/us.anthropic.*`,
+              // Account-scoped inference profiles
+              `arn:aws:bedrock:*:${this.account}:inference-profile/*`,
+              // Deployment-region foundation models (catch-all)
+              `arn:aws:bedrock:${this.region}::foundation-model/*`,
+            ],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForBedrock', agentCoreRoleName),
+        ],
+      });
+
+      new iam.ManagedPolicy(this, 'AgentCoreECRPolicy', {
+        description: 'Allows AgentCore execution role to pull container images from ECR',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'ecr:GetAuthorizationToken',
+              'ecr:BatchGetImage',
+              'ecr:GetDownloadUrlForLayer',
+            ],
+            resources: ['*'],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForECR', agentCoreRoleName),
+        ],
+      });
+
+      new iam.ManagedPolicy(this, 'AgentCoreCloudWatchPolicy', {
+        description: 'Allows AgentCore execution role to push CloudWatch metrics and write logs',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['cloudwatch:PutMetricData'],
+            resources: ['*'],
+            conditions: {
+              StringEquals: { 'cloudwatch:namespace': 'ClaudeCodeAgent' },
             },
-          },
-        }),
-      ],
-      roles: [
-        iam.Role.fromRoleName(
-          this,
-          'AgentCoreExecutionRoleForCloudWatch',
-          'AmazonBedrockAgentCoreSDKRuntime-us-west-2-f3ae55dcc2'
-        ),
-      ],
-    });
+          }),
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'logs:CreateLogGroup',
+              'logs:CreateLogStream',
+              'logs:PutLogEvents',
+              'logs:DescribeLogGroups',
+              'logs:DescribeLogStreams',
+              'logs:FilterLogEvents',
+            ],
+            resources: [
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/bedrock-agentcore/*`,
+              `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/bedrock-agentcore/*:*`,
+            ],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForCloudWatch', agentCoreRoleName),
+        ],
+      });
+
+      new iam.ManagedPolicy(this, 'AgentCoreXRayPolicy', {
+        description: 'Allows AgentCore execution role to send traces and telemetry to X-Ray',
+        statements: [
+          new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'xray:PutTraceSegments',
+              'xray:PutTelemetryRecords',
+              'xray:GetSamplingRules',
+              'xray:GetSamplingTargets',
+            ],
+            resources: ['*'],
+          }),
+        ],
+        roles: [
+          iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForXRay', agentCoreRoleName),
+        ],
+      });
+    } // end if (agentCoreRoleName)
 
     // ========================================================================
     // S3 Bucket + CloudFront - Screenshot storage for agent builds
     // ========================================================================
     const screenshotsBucket = new s3.Bucket(this, 'ScreenshotsBucket', {
-      bucketName: `${projectName}-${environment}-screenshots`,
+      bucketName: `${projectName}-${environment}-screenshots-${this.account}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -283,19 +395,17 @@ export class ClaudeCodeStack extends cdk.Stack {
     });
 
     // Grant AgentCore execution role write access to S3
-    screenshotsBucket.grantWrite(
-      iam.Role.fromRoleName(
-        this,
-        'AgentCoreExecutionRoleForScreenshots',
-        'AmazonBedrockAgentCoreSDKRuntime-us-west-2-f3ae55dcc2'
-      )
-    );
+    if (agentCoreRoleName) {
+      screenshotsBucket.grantWrite(
+        iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForScreenshots', agentCoreRoleName)
+      );
+    }
 
     // ========================================================================
     // S3 Bucket + CloudFront - App Preview hosting for agent builds
     // ========================================================================
     const previewsBucket = new s3.Bucket(this, 'PreviewsBucket', {
-      bucketName: `${projectName}-${environment}-previews`,
+      bucketName: `${projectName}-${environment}-previews-${this.account}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -372,13 +482,11 @@ function handler(event) {
     });
 
     // Grant AgentCore execution role write access to previews bucket (for future inline builds)
-    previewsBucket.grantWrite(
-      iam.Role.fromRoleName(
-        this,
-        'AgentCoreExecutionRoleForPreviews',
-        'AmazonBedrockAgentCoreSDKRuntime-us-west-2-f3ae55dcc2'
-      )
-    );
+    if (agentCoreRoleName) {
+      previewsBucket.grantWrite(
+        iam.Role.fromRoleName(this, 'AgentCoreExecutionRoleForPreviews', agentCoreRoleName)
+      );
+    }
 
     // IAM Role for GitHub Actions Preview Deployment
     const githubPreviewDeployRole = new iam.Role(this, 'GitHubPreviewDeployRole', {
@@ -420,12 +528,20 @@ function handler(event) {
       ],
     }));
 
-    // Grant the GitHub Actions deployer user permission to assume the preview deploy role
-    const githubActionsUser = iam.User.fromUserName(
-      this,
-      'GitHubActionsUser',
-      'github-actions-deployer'
-    );
+    // CloudFormation read permission so deploy-preview can resolve the API URL
+    // The agent-generated stack name (e.g. canopy-app-stack) isn't known at harness
+    // deploy time, so we allow DescribeStacks on all stacks in this account/region.
+    githubPreviewDeployRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['cloudformation:DescribeStacks'],
+      resources: ['*'],
+    }));
+
+    // Create IAM user for GitHub Actions (or use existing user via context)
+    const existingGithubActionsUserName = this.node.tryGetContext('githubActionsUserName') || '';
+    const githubActionsUser = existingGithubActionsUserName
+      ? iam.User.fromUserName(this, 'GitHubActionsUser', existingGithubActionsUserName)
+      : new iam.User(this, 'GitHubActionsUser');
 
     new iam.Policy(this, 'GitHubActionsUserPreviewDeployPolicy', {
       policyName: 'AllowAssumePreviewDeployRole',
@@ -441,11 +557,238 @@ function handler(event) {
     });
 
     // ========================================================================
+    // IAM Role for GitHub Actions Infrastructure Deployment (CDK)
+    //
+    // Threat model: this role runs `cdk deploy --require-approval never` on
+    // CDK code the agent generated and pushed to `agent-runtime`. It must be
+    // able to provision the app's resources, but it must NOT be able to grant
+    // itself (or any role it creates) more privilege than that. The control
+    // is a permissions boundary that every agent-created IAM role MUST carry.
+    // ========================================================================
+
+    // Permissions boundary that caps what any agent-created IAM role may do.
+    // Even if the agent attaches AdministratorAccess to a role it creates,
+    // the effective permissions are the intersection with this boundary.
+    const agentRoleBoundary = new iam.ManagedPolicy(this, 'AgentCreatedRoleBoundary', {
+      managedPolicyName: `${projectName}-${environment}-agent-role-boundary`,
+      description:
+        'Permissions boundary required on all IAM roles created by agent-generated CDK stacks. ' +
+        'Caps those roles to the application data plane regardless of policies attached.',
+      statements: [
+        new iam.PolicyStatement({
+          sid: 'AppDataPlane',
+          effect: iam.Effect.ALLOW,
+          actions: [
+            'dynamodb:*',
+            'lambda:InvokeFunction',
+            'logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents',
+            'logs:DescribeLogGroups', 'logs:DescribeLogStreams',
+            's3:GetObject', 's3:PutObject', 's3:DeleteObject', 's3:ListBucket',
+            'execute-api:Invoke', 'execute-api:ManageConnections',
+            'xray:PutTraceSegments', 'xray:PutTelemetryRecords',
+            'ssm:GetParameter', 'ssm:GetParameters',
+          ],
+          resources: ['*'],
+        }),
+        // Explicitly deny privilege-escalation primitives inside the boundary
+        // so an agent-created role can never mint or modify other roles, even
+        // if an attached policy allows it.
+        new iam.PolicyStatement({
+          sid: 'DenyPrivescInsideBoundary',
+          effect: iam.Effect.DENY,
+          actions: [
+            'iam:*', 'sts:AssumeRole', 'organizations:*',
+            'secretsmanager:*', 'kms:Decrypt', 'kms:CreateGrant',
+          ],
+          resources: ['*'],
+        }),
+      ],
+    });
+
+    const infraDeployRole = new iam.Role(this, 'GitHubInfraDeployRole', {
+      roleName: `${projectName}-github-infra-deploy`,
+      description: 'Role for GitHub Actions to deploy agent-written CDK infrastructure',
+      assumedBy: new iam.AccountPrincipal(cdk.Stack.of(this).account),
+      maxSessionDuration: cdk.Duration.hours(1),
+    });
+
+    infraDeployRole.assumeRolePolicy?.addStatements(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.AccountPrincipal(cdk.Stack.of(this).account)],
+        actions: ['sts:TagSession'],
+      })
+    );
+
+    // Service permissions for provisioning the app's resources. IAM-write
+    // actions are intentionally NOT in this statement — they are granted
+    // separately below with a permissions-boundary condition.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ProvisionAppResources',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        // CloudFormation (required for CDK)
+        'cloudformation:*',
+        // Lambda
+        'lambda:*',
+        // API Gateway (HTTP API)
+        'apigateway:*',
+        'apigatewayv2:*',
+        // DynamoDB
+        'dynamodb:*',
+        // IAM read-only (CDK needs to look up roles it creates)
+        'iam:GetRole', 'iam:GetRolePolicy', 'iam:GetPolicy',
+        'iam:GetPolicyVersion', 'iam:ListRolePolicies',
+        'iam:ListAttachedRolePolicies', 'iam:ListPolicyVersions',
+        // S3 (for CDK assets + app deployment)
+        's3:*',
+        // CloudFront
+        'cloudfront:*',
+        // CloudWatch Logs (Lambda creates log groups)
+        'logs:*',
+        // SSM (for CDK parameters)
+        'ssm:GetParameter', 'ssm:PutParameter', 'ssm:DeleteParameter',
+        // STS (CDK asset publishing)
+        'sts:AssumeRole',
+        // ECR (if Lambda uses container images)
+        'ecr:*',
+      ],
+      resources: ['*'],  // Scoped by service, not resource ARN (CDK creates dynamic names)
+    }));
+
+    // IAM role lifecycle — only with the permissions boundary attached.
+    // Without `iam:PermissionsBoundary == agentRoleBoundary`, CreateRole and
+    // PutRolePermissionsBoundary are denied, so the agent's CDK cannot mint
+    // an unbounded role. The deploy workflow passes
+    // `--context @aws-cdk/core:permissionsBoundary` so vanilla CDK constructs
+    // attach the boundary automatically.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CreateBoundedRolesOnly',
+      effect: iam.Effect.ALLOW,
+      actions: ['iam:CreateRole', 'iam:PutRolePermissionsBoundary'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'iam:PermissionsBoundary': agentRoleBoundary.managedPolicyArn,
+        },
+      },
+    }));
+
+    // Mutating a role's policies is only allowed when the *target role*
+    // already carries the permissions boundary. This stops the agent's CDK
+    // from importing a pre-existing privileged role
+    // (`iam.Role.fromRoleName(...)`) and attaching AdministratorAccess to it
+    // — the role lacks the boundary, so the condition fails.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ModifyBoundedRolesOnly',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'iam:AttachRolePolicy', 'iam:DetachRolePolicy',
+        'iam:PutRolePolicy', 'iam:DeleteRolePolicy', 'iam:DeleteRole',
+      ],
+      resources: ['*'],
+      conditions: {
+        StringEquals: {
+          'iam:PermissionsBoundary': agentRoleBoundary.managedPolicyArn,
+        },
+      },
+    }));
+
+    // Role metadata, managed-policy lifecycle, and PassRole. These actions
+    // don't support the iam:PermissionsBoundary condition key, so they are
+    // gated by the explicit DENY on privileged roles below instead.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ManageRoleMetadataAndPolicies',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'iam:UpdateRole', 'iam:TagRole', 'iam:UntagRole',
+        'iam:UpdateAssumeRolePolicy',
+        'iam:CreatePolicy', 'iam:DeletePolicy',
+        'iam:CreatePolicyVersion', 'iam:DeletePolicyVersion',
+        'iam:PassRole',
+      ],
+      resources: ['*'],
+    }));
+
+    // DENY expensive/dangerous services explicitly.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyExpensiveServices',
+      effect: iam.Effect.DENY,
+      actions: [
+        'rds:*', 'ec2:RunInstances', 'ec2:CreateNatGateway',
+        'ecs:CreateCluster', 'ecs:CreateService',
+        'elasticache:*', 'redshift:*', 'opensearch:*',
+        'sagemaker:*', 'bedrock:*',
+      ],
+      resources: ['*'],
+    }));
+
+    // The boundary is the load-bearing control. Removing it from a role, or
+    // mutating the boundary policy itself, must always be denied — explicit
+    // DENY beats any ALLOW above.
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyBoundaryTampering',
+      effect: iam.Effect.DENY,
+      actions: [
+        'iam:DeleteRolePermissionsBoundary',
+        'iam:DeletePolicy',
+        'iam:DeletePolicyVersion',
+        'iam:CreatePolicyVersion',
+        'iam:SetDefaultPolicyVersion',
+      ],
+      resources: [agentRoleBoundary.managedPolicyArn],
+    }));
+
+    // Hard deny on tampering with this project's own privileged roles, the
+    // AgentCore execution role, and the CDK bootstrap roles. Covers PassRole
+    // (a Lambda can't inherit these roles), UpdateAssumeRolePolicy (can't
+    // widen who may assume them), policy attach/put (can't add permissions),
+    // and PutRolePermissionsBoundary (can't replace their boundary or DoS
+    // them by adding the agent boundary).
+    infraDeployRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DenyTamperPrivilegedRoles',
+      effect: iam.Effect.DENY,
+      actions: [
+        'iam:PassRole',
+        'iam:UpdateAssumeRolePolicy',
+        'iam:AttachRolePolicy', 'iam:DetachRolePolicy',
+        'iam:PutRolePolicy', 'iam:DeleteRolePolicy',
+        'iam:PutRolePermissionsBoundary', 'iam:DeleteRolePermissionsBoundary',
+        'iam:DeleteRole', 'iam:UpdateRole', 'iam:CreateRole',
+      ],
+      resources: [
+        `arn:aws:iam::${this.account}:role/${projectName}-*`,
+        `arn:aws:iam::${this.account}:role/AmazonBedrockAgentCore*`,
+        ...(agentCoreRoleName
+          ? [`arn:aws:iam::${this.account}:role/${agentCoreRoleName}`]
+          : []),
+        `arn:aws:iam::${this.account}:role/cdk-*`,
+        `arn:aws:iam::${this.account}:role/aws-service-role/*`,
+        infraDeployRole.roleArn,
+      ],
+    }));
+
+    // Allow GitHub Actions user to assume the infra deploy role
+    new iam.Policy(this, 'GitHubActionsUserInfraDeployPolicy', {
+      policyName: 'AllowAssumeInfraDeployRole',
+      users: [githubActionsUser],
+      statements: [
+        new iam.PolicyStatement({
+          sid: 'AllowAssumeInfraDeployRole',
+          effect: iam.Effect.ALLOW,
+          actions: ['sts:AssumeRole', 'sts:TagSession'],
+          resources: [infraDeployRole.roleArn],
+        }),
+      ],
+    });
+
+    // ========================================================================
     // CloudWatch Dashboard - Agent Monitoring for re:Invent Demo
     // ========================================================================
     // Note: AgentCore logs go to /aws/bedrock-agentcore/runtimes/{runtime-id}
     // Specify the exact log group name (wildcards not supported in dashboard widgets)
-    const agentLogGroupName = '/aws/bedrock-agentcore/runtimes/antodo_agent-0UyfaL5NVq-DEFAULT';
+    const agentRuntimeId = this.node.tryGetContext('agentRuntimeId') || 'YOUR_AGENT_RUNTIME_ID';
+    const agentLogGroupName = `/aws/bedrock-agentcore/runtimes/${agentRuntimeId}-DEFAULT`;
 
     // Dashboard variable for filtering by Issue Number
     // Use fromSearch with explicit search string that includes ALL dimensions
@@ -735,6 +1078,12 @@ function handler(event) {
       value: githubPreviewDeployRole.roleArn,
       description: 'IAM role ARN for GitHub Actions preview deployment',
       exportName: `${projectName}-github-preview-deploy-role`,
+    });
+
+    new cdk.CfnOutput(this, 'GitHubInfraDeployRoleArn', {
+      value: infraDeployRole.roleArn,
+      description: 'IAM role ARN for GitHub Actions infrastructure deployment',
+      exportName: `${projectName}-github-infra-deploy-role`,
     });
 
     new cdk.CfnOutput(this, 'DashboardUrl', {

@@ -344,7 +344,7 @@ exit 0
 
         try:
             hook_path.write_text(hook_script)
-            os.chmod(hook_path, 0o755)
+            os.chmod(hook_path, 0o750)
             builtins.print(f"✅ Post-commit hook installed at {hook_path}")
             return True
         except Exception as e:

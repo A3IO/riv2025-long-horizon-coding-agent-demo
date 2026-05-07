@@ -133,8 +133,12 @@ async function run() {
       errors.push(error.message);
     });
 
-    // Navigate to page
-    await page.goto(config.url);
+    // Navigate to page (URL already validated to localhost-only in validate())
+    const validatedUrl = new URL(config.url);
+    if (!['http:', 'https:'].includes(validatedUrl.protocol) || !['localhost', '127.0.0.1'].includes(validatedUrl.hostname)) {
+      throw new Error(`Refused to navigate to non-local URL: ${config.url}`);
+    }
+    await page.goto(validatedUrl.href);
     await page.waitForLoadState('networkidle');
     await new Promise((r) => setTimeout(r, 2000));
 

@@ -3,7 +3,7 @@
 from typing import Any
 
 # Model defaults
-DEFAULT_MODEL = "claude-opus-4-5-20251101"
+DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 # Port defaults
 DEFAULT_FRONTEND_PORT = 6174
@@ -71,11 +71,14 @@ ALLOWED_BASH_COMMANDS = [
     "playwright",
     "python3",
     "google-chrome",
+    "cdk",      # CDK synth, diff, test (NOT deploy)
+    "aws",      # Read-only verification (describe-stacks, etc.)
+    "esbuild",  # Lambda bundling
 ]
 
 # Special command patterns
 ALLOWED_RM_COMMANDS = ["rm -rf node_modules"]
-ALLOWED_NODE_PATTERNS = ["server.js", "server/index.js", "playwright-test.cjs"]
+ALLOWED_NODE_PATTERNS = ["server.js", "server/index.js", "playwright-test.cjs", "backend-verify.cjs"]
 ALLOWED_PKILL_PATTERNS = [
     'pkill -f "node server/index.js"',
     'pkill -f "node server.js"',

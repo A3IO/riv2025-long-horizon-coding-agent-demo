@@ -554,6 +554,7 @@ You are enhancing an EXISTING application. Your task is to implement the feature
 - Add the requested functionality as described above
 - Follow the existing code patterns and style
 - Add NEW tests to tests.json for the new feature (append to existing array)
+- Every tests.json entry MUST include a "category" field: "shared", "infrastructure", "backend", or "frontend". Only shared/infrastructure/backend tests may use backend-verify.cjs; frontend tests require a Playwright screenshot.
 - Update claude-progress.txt with your changes
 
 ### 4. Testing Your Changes
@@ -564,6 +565,15 @@ You are enhancing an EXISTING application. Your task is to implement the feature
 ### 5. Port Configuration
 - Frontend MUST use port: {frontend_port}
 - Backend MUST use port: {backend_port}
+
+### 5b. Infrastructure (for full-stack projects)
+If the project has an infrastructure/ directory:
+- Check and update CDK stack if the feature requires new resources (new DynamoDB GSI, new Lambda endpoint, etc.)
+- Run `npx cdk synth` to validate the CDK template compiles
+- Run `npm test` in infrastructure/ to ensure CDK tests pass
+- Add new Lambda handlers in backend/ if new API endpoints are needed
+- Update the API client in frontend/src/api/ for new endpoints
+- NEVER run `cdk deploy` — deployment happens via CI/CD
 
 ### 6. Test Verification (CRITICAL - ENFORCED BY SYSTEM)
 For EACH test in tests.json, you MUST follow this exact process:
@@ -981,38 +991,54 @@ def _create_claude_client(
     # For Docker/AWS deployment: explicitly set CLI path if in containerized environment
     cli_path = "/usr/local/bin/claude" if os.path.exists("/usr/local/bin/claude") else None
 
-    return ClaudeSDKClient(
-        options=ClaudeAgentOptions(
-            model=args.model,
-            system_prompt=system_prompt,
-            cli_path=cli_path,  # Explicitly set for Docker compatibility
-            allowed_tools=[
-                "think",
-                "Read",
-                "Glob",
-                "Grep",
-                "Write",
-                "Edit",
-                "MultiEdit",
-                "Bash",
+    # Build environment variables for the SDK subprocess
+    # Note: The SDK merges env with os.environ ({**os.environ, **env}),
+    # so we only need to set Bedrock-specific overrides
+    sdk_env = {}
+    if os.environ.get("CLAUDE_CODE_USE_BEDROCK") == "1":
+        sdk_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        sdk_env["AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
+
+    options_kwargs = dict(
+        model=args.model,
+        system_prompt=system_prompt,
+        permission_mode="bypassPermissions",
+        cli_path=cli_path,  # Explicitly set for Docker compatibility
+        allowed_tools=[
+            "think",
+            "Read",
+            "Glob",
+            "Grep",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Bash",
+            "Agent",
+        ],
+        disallowed_tools=[],
+        mcp_servers={},
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="*", hooks=[universal_path_security_hook_wrapper]
+                ),
             ],
-            disallowed_tools=[],
-            mcp_servers={},
-            hooks={
-                "PreToolUse": [
-                    HookMatcher(
-                        matcher="*", hooks=[universal_path_security_hook_wrapper]
-                    ),
-                ],
-                "PostToolUse": [
-                    HookMatcher(matcher="Bash", hooks=[cd_enforcement_hook_wrapper]),
-                    HookMatcher(matcher="Read", hooks=[track_read_hook_wrapper]),
-                ],
-            },
-            max_turns=10000,
-            cwd=str(generation_dir),
-            add_dirs=[str(generation_dir / "prompts")],
-        )
+            "PostToolUse": [
+                HookMatcher(matcher="Bash", hooks=[cd_enforcement_hook_wrapper]),
+                HookMatcher(matcher="Read", hooks=[track_read_hook_wrapper]),
+            ],
+        },
+        max_turns=10000,
+        cwd=str(generation_dir),
+        add_dirs=[str(generation_dir / "prompts")],
+    )
+
+    # Pass Bedrock env vars if configured
+    if sdk_env:
+        options_kwargs["env"] = sdk_env
+
+    return ClaudeSDKClient(
+        options=ClaudeAgentOptions(**options_kwargs)
     )
 
 
@@ -1172,38 +1198,101 @@ CRITICAL PORT CONFIGURATION:
 - You MUST configure backend server to use port: {args.backend_port}
 - Never use default ports (5173, 3000) as they may conflict with other running apps
 
+INFRASTRUCTURE SETUP (for full-stack projects):
+If the BUILD_PLAN specifies a full-stack architecture with infrastructure/:
+1. Set up the monorepo structure FIRST: shared/, backend/, infrastructure/, frontend/
+2. Complete Phase 1 (shared contract) and commit
+3. Write the CDK stack (infrastructure/lib/) — DynamoDB, Lambda, API Gateway
+4. Write CDK tests (infrastructure/test/) — snapshot + assertion tests
+5. Write **stub Lambda handlers** in backend/src/handlers/ — minimal handlers that compile but return placeholder responses. CDK needs these to bundle.
+6. Run `npx cdk synth` to validate the template compiles (NEVER run `cdk deploy`)
+7. Commit and PUSH the infrastructure + stub handlers — CI/CD will deploy the stack automatically
+8. **WAIT for CI/CD deployment to succeed** before writing full backend handlers or frontend API calls. Poll SSM deploy-state until status is "succeeded".
+9. Once deployed, implement the full Lambda handlers (replacing stubs), then wire the frontend to the API URL
+10. NEVER run `cdk deploy` yourself — deployment happens via CI/CD only
+
+INFRASTRUCTURE DEPLOYMENT — WAIT FOR IT:
+After you push infrastructure code, CI/CD deploys it automatically (deploy-infrastructure.yml).
+You MUST wait for deployment to succeed before implementing backend handlers or frontend API calls.
+Deployment state is stored in SSM. Poll it:
+  STATUS=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --region us-east-1 --query Parameter.Value --output text | jq -r '.status')
+  API_URL=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --region us-east-1 --query Parameter.Value --output text | jq -r '.apiUrl')
+
+  - status="deploying" → deployment is in progress. Poll again in 30-60 seconds.
+  - status="succeeded" → infrastructure is live! Use the apiUrl to verify: `curl -s $API_URL/projects`
+  - status="failed" → deployment failed. Check your CDK code for errors, fix, commit, and push again.
+  - ParameterNotFound → no deployment has been attempted yet. Push your infrastructure code first.
+
+**Do NOT proceed to write full backend handlers or frontend API client until status="succeeded" and you have the API URL.**
+
+After verifying the API is live, record the deploy commit and API URL in claude-progress.txt.
+
 """
             message += """
-You absolutely must start by writing a detailed testing plan in tests.json. This should include at least 200 extremely detailed end-to-end tests that must be completed using Playwright CLI for screenshots and manual verification. The JSON file should be an array of objects in this format:
+Start implementation with Phase 1 (shared contract) BEFORE writing any frontend code. Follow the Phased Execution order in the system prompt strictly.
+
+Write a testing plan in tests.json with ~50 tests covering all phases. The JSON file should be an array of objects in this format:
 [
-  {"category": "functional",
-    "description": "User can sign in and navigate to the home page",
+  {"category": "shared",
+    "description": "Shared schemas compile with no TypeScript errors",
     "steps": [
-      "Navigate to the sign-in page",
-      "Enter credentials",
-      "Click sign-in button",
-      "Verify redirection to home page"
+      "Run cd shared && npx tsc --noEmit",
+      "Verify exit code 0"
+    ],
+    "passes": false
+  },
+  {"category": "infrastructure",
+    "description": "CDK stack synthesizes successfully",
+    "steps": [
+      "Run cd infrastructure && npx cdk synth",
+      "Verify CloudFormation template is produced"
+    ],
+    "passes": false
+  },
+  {"category": "backend",
+    "description": "Lambda handler returns correct response for valid input",
+    "steps": [
+      "Import handler from backend/src/handlers/",
+      "Call with valid request body",
+      "Verify 200 response with expected shape"
+    ],
+    "passes": false
+  },
+  {"category": "functional",
+    "description": "User can navigate to the home page and see content",
+    "steps": [
+      "Navigate to the home page",
+      "Take a screenshot",
+      "Verify main content is visible"
     ],
     "passes": false
   },
   {"category": "style",
-    "description": "Sign-in component is perfectly formatted, well-spaced, clean, and modern",
+    "description": "Home page is well-designed with proper spacing and typography",
     "steps": [
-      "Navigate to the sign-in page",
+      "Navigate to the home page",
       "Take a screenshot",
-      "Verify that the forms and buttons on the sign-in page are well-spaced",
-      "Verify redirection to home page"
+      "Verify layout, spacing, and typography are polished"
     ],
     "passes": false
   },
   ...
 ]
 
-There should be distinct tests for both functionality and style/UI quality. For example, a good end-to-end test case is 'Navigated to Page X. Clicked the Search Bar. Inputted Text. Clicked the Search button. Saw Successful search results.'. You can only mark a test as complete once you have successfully completed a run through the web site and reviewed the screenshots.
+The first ~10 tests should verify shared/ schema compilation and backend handler responses. The next ~10 should verify infrastructure (CDK synth, CDK tests pass, stack outputs correct). The remaining ~30 should cover frontend UI functionality and styling. Order tests with the most fundamental phases first.
 
-There should be a good mix of both short and very long functional tests. A functional test can span as many as 20 steps. For example, a long functional test may require logging in to the app, opening a DM with another user, sending a message, starting a thread in that message, replying in that thread, and seeing the AI response in that thread. At least 25 of the tests MUST have at least 10 steps.
+**Backend tests use `backend-verify.cjs`** (not playwright-test.cjs). For shared/infra/backend tests:
+```bash
+node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"
+```
+Then Read both the -result.txt and -console.txt files before marking as passing.
 
-Order the tests with the most fundamental functionality first, and the most advanced features last. This way, you can build up the app piece by piece and verify that the core functionality is working before moving on to more advanced features. You should also start with a foundation for a beautiful, modern design.
+**VITE_API_URL wiring**: After infrastructure deploys and you discover the API URL from SSM:
+```bash
+API_URL=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.apiUrl')
+echo "VITE_API_URL=$API_URL" > frontend/.env
+```
+Then restart the frontend dev server so it picks up the new environment variable. The frontend API client should use `import.meta.env.VITE_API_URL` as the base URL.
 
 Make sure you don't miss anything! It's extremely important that we implement every feature so that this is a fully production-quality website with no bugs. You have unlimited time, so take as long as you need to get everything perfect. This is not a demo, it's a production-quality final product.
 
@@ -1263,6 +1352,31 @@ CRITICAL PORT CONFIGURATION:
 
 You absolutely must start by reading the claude-progress.txt and tests.json files and the git history to see how many tests have been completed and what work is remaining. DO NOT UNDER ANY CIRCUMSTANCES remove test cases from claude-progress.txt. You should only check a box for a unit test when it's perfectly done.
 
+**INFRASTRUCTURE VERIFICATION (for full-stack projects)**:
+If the project has an infrastructure/ directory:
+1. Check CDK test results: `cd infrastructure && npm test`
+2. Verify CDK synthesis: `cd infrastructure && npx cdk synth`
+3. **Check deployment state from CI/CD**:
+   Deployment state is a single atomic JSON object in SSM. Fetch and parse it:
+   ```
+   DEPLOY_STATE=$(aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text)
+   STATUS=$(echo "$DEPLOY_STATE" | jq -r '.status')
+   DEPLOY_COMMIT=$(echo "$DEPLOY_STATE" | jq -r '.commit')
+   API_URL=$(echo "$DEPLOY_STATE" | jq -r '.apiUrl')
+   ```
+
+   - status="succeeded" → Infrastructure is deployed. Now:
+     a. Verify API is reachable: `curl -s $API_URL/projects`
+     b. If you haven't written full Lambda handlers yet (only stubs), NOW implement them
+     c. If frontend/.env doesn't have VITE_API_URL, create it and restart dev server
+     d. Update claude-progress.txt with API URL and deploy commit
+   - status="deploying" → Deployment in progress. Poll again in 30-60 seconds. Do NOT write full backend handlers or frontend API calls until this succeeds.
+   - status="failed" → Deployment failed. Check CDK code for errors, fix, commit, push.
+   - ParameterNotFound → No deployment attempted yet. Push infrastructure code if not done.
+
+4. If infrastructure tests are failing, fix them before moving to other work
+5. NEVER run `cdk deploy` — deployment happens via CI/CD only
+
 **CHECK FOR WIP COMMITS**: Run `git log --oneline -5` to check recent commits. If you see a commit starting with "wip:" (e.g., "wip: Session timeout approaching"), this means the previous session was interrupted by a timeout and created an automatic work-in-progress commit. This WIP commit contains all uncommitted work from the previous session. You should:
 1. Review what was being worked on from the WIP commit message
 2. Read claude-progress.txt to understand the current state
@@ -1306,7 +1420,7 @@ If `init.sh` already exists, you should run it to restart the servers. Otherwise
 
 `init.sh` should start by running a unit test suite. You should add to this unit test suite as you add new features, and make sure it continues to pass all tests before moving on to Playwright tests.
 
-CRITICAL: YOU CAN ONLY CHANGE ONE LINE OF THE tests.json FILE AT A TIME. THE ONLY CHANGES YOU CAN MAKE TO THE TESTS IS CHANGING THE "passes" FIELD, AND YOU MAY ONLY DO THIS WHEN YOU HAVE VERIFIED THAT A TEST PASSES BY DOING THE TESTING YOURSELF. IT IS CATASTROPHIC TO REMOVE OR EDIT TESTS BECAUSE THIS MEANS THAT FUNCTIONALITY COULD BE MISSING OR BUGGY.
+When updating tests.json, only change the "passes" field after verifying each test yourself. Do not remove or rewrite existing tests.
 
 **IMPORTANT**: If human_backlog.json exists, prioritize items in this order:
 1. Items with status "in progress" - finish what was started
@@ -1317,18 +1431,26 @@ CRITICAL: YOU CAN ONLY CHANGE ONE LINE OF THE tests.json FILE AT A TIME. THE ONL
 
 These are explicit human requests that take precedence over general test completion work.
 
-Since this is a continuation session, you should be very skeptical about the current state of the project. The last session may have broken tests that were marked as complete. After reading the progress notes, you should start the session by running through 1-2 of the longest and most fundamental functional tests that are marked as complete, if any are. If this verification shows any issues at all, you should immediately mark the test as "passes": false and work on fixing it before moving on to new features. This includes UI bugs: if you see issues, you should fix those immediately. Make a list of any UI imperfections that you see and prioritize those above adding new functionality.
+Since this is a continuation session, do a quick sanity check after reading progress notes: run 1-2 previously-passing tests to confirm nothing regressed. If something broke, fix it before adding new features.
 
-Check for a list of UI bugs like the following:
- 1. white-on-white or otherwise hard to read text
- 2. random characters being displayed (e.g. "0" randomly placed after a username)
- 3. message timestamps being reported in the future
- 4. sidebars not being displayed due to components overflowing with no scrolling
- 5. buttons or text being too close together or overlapping
+**Test verification by category:**
+- **shared/infrastructure/backend tests** → use `backend-verify.cjs`:
+  `node backend-verify.cjs --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --command "<CMD>"`
+  Then Read both -result.txt and -console.txt before marking as passing.
+- **frontend/style tests** → use `playwright-test.cjs`:
+  `node playwright-test.cjs --url http://localhost:{args.frontend_port} --test-id <TEST_ID> --output-dir screenshots/issue-$ISSUE_NUMBER --operation full`
+  Then Read both the screenshot PNG and -console.txt before marking as passing.
 
-An example of a test that verifies fundamental functionality is {example_test}
+An example of tests that verify fundamental functionality: {example_test}
 
-Your goal is ultimately to have a perfect UI and to get all the tests checked off, and in this session, you should try to make incremental progress towards that goal. Once you've read the progress file and the git history and verified basic functionality, you should start with the most critical uncompleted test and try to get it working, then move on to the next one only when it's perfectly done.
+**VITE_API_URL wiring**: If the frontend needs to talk to the deployed API, create `frontend/.env` with:
+```
+VITE_API_URL=<API_URL from SSM deploy-state>
+```
+Discover the API URL: `aws ssm get-parameter --name /claude-code/infra/deploy-state --query Parameter.Value --output text | jq -r '.apiUrl'`
+Then restart the frontend dev server for the env var to take effect.
+
+Your goal is to make incremental progress: verify the phase gates pass (shared compiles, infrastructure synths, backend builds, frontend builds), then work on the most critical uncompleted test.
 
 **The Boy Scout Rule: Leave It Better Than You Found It**
 Before you end your session, it is MANDATORY for you to take a moment to scan your changes. Did you add appropriate tests for your new code? Are files organized according to the project's structure? If you touched existing code, did you clean up any unused or outdated pieces you spotted along the way? Did you create many files when you could have consolidated them?
@@ -1733,13 +1855,14 @@ async def main() -> None:
                     shutil.copy2(item, dest)
             builtins.print(f"📂 Cloned template to {generation_dir}")
 
-        # Setup prompts
-        SessionManager.setup_session_prompts(
-            generation_dir,
-            prompts_dir,
-            template_vars,
-            bootstrap_files=args.bootstrap_files,
-        )
+    # Always setup prompts (even for existing projects — prompts come from the
+    # Docker image and must be refreshed so enhancement mode has them available)
+    SessionManager.setup_session_prompts(
+        generation_dir,
+        prompts_dir,
+        template_vars,
+        bootstrap_files=args.bootstrap_files if not is_existing_project else False,
+    )
 
     # Validate cleanup-session requires existing project
     if args.cleanup_session and not is_existing_project:

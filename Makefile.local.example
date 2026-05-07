@@ -1,0 +1,36 @@
+# Makefile.local — local overrides for your deployment
+#
+# HOW TO USE:
+#   cp Makefile.local.example Makefile.local
+#   Edit Makefile.local with your values
+#
+# Makefile.local is loaded automatically by the Makefile (-include Makefile.local).
+# It is .gitignored so your account-specific values stay out of version control.
+
+# ─── AWS Configuration ────────────────────────────────────────────────────────
+AWS_PROFILE ?= default
+AWS_REGION  ?= us-east-1       # Region where you deployed CDK infrastructure
+
+# ─── CDK Stack Configuration ──────────────────────────────────────────────────
+# Short identifier for your deployment environment (e.g. dev, prod, demo)
+ENVIRONMENT ?= dev
+
+# Your existing VPC ID — leave blank to let CDK create a new one (watch VPC limits!)
+# Find yours: aws ec2 describe-vpcs --query "Vpcs[?IsDefault==\`true\`].VpcId" --output text
+VPC_ID ?= vpc-XXXXXXXXXXXXXXXXX
+
+# ─── AgentCore Runtime ────────────────────────────────────────────────────────
+# Obtain AGENT_RUNTIME_ID after running: make create-runtime
+# It will be printed in the output as "agentRuntimeId".
+AGENT_RUNTIME_ID ?= YOUR_RUNTIME_ID_HERE
+
+# IAM role name for the AgentCore container execution role.
+# Created manually or via CDK with: cdk deploy -c agentCoreRoleName=<name>
+AGENTCORE_ROLE_NAME ?= claude-code-agentcore-role
+
+# Full ARN of the execution role (leave blank to auto-derive from AGENT_RUNTIME_ID above)
+EXECUTION_ROLE_ARN ?= arn:aws:iam::YOUR_ACCOUNT_ID:role/claude-code-agentcore-role
+
+# ─── GitHub Configuration ─────────────────────────────────────────────────────
+# The GitHub repo the agent will clone and commit to (owner/repo format)
+GITHUB_REPO ?= YOUR_ORG/YOUR_REPO

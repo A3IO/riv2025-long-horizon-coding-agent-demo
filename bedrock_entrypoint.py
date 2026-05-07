@@ -16,6 +16,7 @@ import asyncio
 import boto3
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -24,6 +25,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, List
+
+# Configure Python logging so OTEL auto-instrumentation captures our messages
+# The opentelemetry-instrument wrapper hooks into the logging module
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s')
+logger = logging.getLogger("agent.entrypoint")
 
 # OpenTelemetry imports for session ID propagation
 try:
@@ -45,6 +51,21 @@ except ImportError:
     GitManager = None
     GitHubConfig = None
     print("⚠️ GitManager not available (running locally?)")
+
+def _resolve_agent_runtime_arn() -> str:
+    """Return the AgentCore runtime ARN from env, or build it dynamically."""
+    arn = os.environ.get("AGENT_RUNTIME_ARN", "")
+    if not arn:
+        runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
+        if runtime_id:
+            try:
+                region = os.environ.get("AWS_REGION", "us-east-1")
+                acct = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+                arn = f"arn:aws:bedrock-agentcore:{region}:{acct}:runtime/{runtime_id}"
+            except Exception:
+                pass
+    return arn
+
 
 # Track uploaded screenshots by content hash (for deduplication)
 uploaded_screenshots: set[str] = set()
@@ -90,7 +111,7 @@ def get_secret(secret_name: str) -> Optional[str]:
     Returns:
         Secret value or None if failed
     """
-    region = os.environ.get("AWS_REGION", "us-west-2")
+    region = os.environ.get("AWS_REGION", "us-east-1")
     client = boto3.client('secretsmanager', region_name=region)
 
     try:
@@ -230,7 +251,7 @@ exit 0
         hook_path.write_text(hook_script)
 
         # Make it executable
-        os.chmod(hook_path, 0o755)
+        os.chmod(hook_path, 0o750)
 
         print(f"✅ Post-commit hook installed at {hook_path}")
         return True
@@ -293,8 +314,12 @@ def scan_and_install_hooks(build_dir: Path, github_repo: str, branch_name: str) 
 
     try:
         # Find all .git directories under build_dir
+        # Skip node_modules to avoid scanning nested workspace dependencies
         for git_dir in build_dir.rglob(".git"):
             if not git_dir.is_dir():
+                continue
+            # Skip .git dirs inside node_modules (monorepo workspace deps)
+            if "node_modules" in git_dir.parts:
                 continue
 
             git_dir_str = str(git_dir)
@@ -376,6 +401,7 @@ GITHUB_BUILD_DIR = Path("/app/github-builds")
 # Agent runtime directory (ephemeral filesystem in AgentCore)
 AGENT_RUNTIME_DIR = Path("/app/workspace/agent-runtime")
 AGENT_BRANCH = "agent-runtime"
+BASE_BRANCH = os.environ.get("BASE_BRANCH", "main")
 
 # Backlog file path (ephemeral - state is recovered from git on session start)
 BACKLOG_FILE_PATH = AGENT_RUNTIME_DIR / "human_backlog.json"
@@ -454,11 +480,11 @@ def setup_agent_runtime(
             raise RuntimeError(f"Git clone timed out after {GIT_TIMEOUT} seconds")
 
         if result.returncode != 0:
-            # Branch doesn't exist - clone main and create the branch
-            print(f"📝 Branch {AGENT_BRANCH} doesn't exist, creating from main...")
+            # Branch doesn't exist - clone base branch and create agent-runtime from it
+            print(f"📝 Branch {AGENT_BRANCH} doesn't exist, creating from {BASE_BRANCH}...")
             try:
                 subprocess.run(
-                    ["git", "clone", clone_url, str(AGENT_RUNTIME_DIR)],
+                    ["git", "clone", "-b", BASE_BRANCH, clone_url, str(AGENT_RUNTIME_DIR)],
                     check=True,
                     timeout=GIT_TIMEOUT
                 )
@@ -858,7 +884,7 @@ def store_session_state_ssm(issue_number: int, session_id: Optional[str] = None)
         True if successful, False otherwise
     """
     try:
-        ssm = boto3.client('ssm', region_name=os.environ.get("AWS_REGION", "us-west-2"))
+        ssm = boto3.client('ssm', region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
         # Store current issue
         ssm.put_parameter(
@@ -895,7 +921,7 @@ def clear_session_state_ssm() -> bool:
         True if successful, False otherwise
     """
     try:
-        ssm = boto3.client('ssm', region_name=os.environ.get("AWS_REGION", "us-west-2"))
+        ssm = boto3.client('ssm', region_name=os.environ.get("AWS_REGION", "us-east-1"))
 
         # Clear current issue
         try:
@@ -1491,7 +1517,7 @@ Commits will be pushed to branch `{branch or 'issue-' + str(issue_number)}`.
 
 If the GitHub Action fails to stop the session:
 ```bash
-AWS_PROFILE=<your-profile> AWS_REGION=us-west-2 agentcore stop-session --session-id "{session_id}"
+AWS_PROFILE=<your-profile> AWS_REGION=us-east-1 agentcore stop-session --session-id "{session_id}"
 ```
 
 </details>
@@ -1677,18 +1703,27 @@ def run_agent_background(
     """
     global agent_process, generation_dir
 
-    # Fetch API key from Secrets Manager
-    api_key = get_anthropic_api_key()
-    if not api_key:
-        print("❌ Cannot start agent without API key")
-        return
+    # Check if using Bedrock for model inference
+    use_bedrock = os.environ.get("CLAUDE_CODE_USE_BEDROCK", "0") == "1"
 
-    model = os.environ.get("DEFAULT_MODEL", "claude-opus-4-5-20251101")
+    if use_bedrock:
+        logger.info("Using Amazon Bedrock for model inference")
+        api_key = None  # Not needed for Bedrock
+    else:
+        # Fetch API key from Secrets Manager
+        api_key = get_anthropic_api_key()
+        if not api_key:
+            logger.error("Cannot start agent without API key (set CLAUDE_CODE_USE_BEDROCK=1 to use Bedrock instead)")
+            return
+
+    model = os.environ.get("DEFAULT_MODEL", "us.anthropic.claude-opus-4-6-v1")
 
     # Determine working directory and command based on mode
     if build_dir is not None:
         # GitHub mode - work in the cloned repo directory
         cwd = str(build_dir)
+
+        project_name = os.environ.get("PROJECT_NAME", "canopy")
 
         if is_enhancement and feature_request_path:
             # Enhancement mode - enhance existing generated-app/
@@ -1696,13 +1731,12 @@ def run_agent_background(
                 "python", "/app/claude_code.py",
                 "--enhance-feature", str(feature_request_path),
                 "--existing-codebase", str(build_dir / "generated-app"),
+                "--project", project_name,
                 "--model", model,
                 "--skip-git-init"  # Don't create nested .git - use cloned repo's git
             ]
         else:
             # Full build mode - build from scratch using BUILD_PLAN
-            # Use PROJECT_NAME env var if set, otherwise default to canopy
-            project_name = os.environ.get("PROJECT_NAME", "canopy")
             cmd = [
                 "python", "/app/claude_code.py",
                 "--project", project_name,
@@ -1710,9 +1744,9 @@ def run_agent_background(
                 "--output-dir", str(build_dir / "generated-app"),
                 "--skip-git-init"  # Don't create nested .git - use cloned repo's git
             ]
-            print(f"📦 Using project: {project_name}")
+        logger.info(f"Using project: {project_name}")
 
-        print(f"🔧 GitHub mode: {'enhancement' if is_enhancement else 'full build'}")
+        logger.info(f"GitHub mode: {'enhancement' if is_enhancement else 'full build'}")
     else:
         # Legacy mode
         cwd = "/app"
@@ -1728,29 +1762,105 @@ def run_agent_background(
         resume_session_id = os.environ.get('RESUME_SESSION_ID')
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
-            print(f"🔄 Resuming session: {resume_session_id}")
+            logger.info(f"Resuming session: {resume_session_id}")
 
-    print(f"📝 Background command: {' '.join(cmd)}")
-    print(f"📁 Working directory: {cwd}")
+    logger.info(f"Background command: {' '.join(cmd)}")
+    logger.info(f"Working directory: {cwd}")
 
-    # Set up environment with API key
+    # Log key environment variables for debugging
+    logger.info(f"CLAUDE_CODE_USE_BEDROCK={os.environ.get('CLAUDE_CODE_USE_BEDROCK', 'NOT SET')}")
+    logger.info(f"AWS_REGION={os.environ.get('AWS_REGION', 'NOT SET')}")
+    logger.info(f"DEFAULT_MODEL={model}")
+    logger.info(f"Running as UID={os.getuid()}, user={os.environ.get('USER', 'unknown')}")
+
+    # Set up environment
     env = os.environ.copy()
-    env['ANTHROPIC_API_KEY'] = api_key
+    if use_bedrock:
+        env['CLAUDE_CODE_USE_BEDROCK'] = '1'
+        env['AWS_REGION'] = os.environ.get('AWS_REGION', 'us-east-1')
+    else:
+        env['ANTHROPIC_API_KEY'] = api_key
 
-    # Start agent subprocess - don't capture output so it goes to CloudWatch
+    # Tell claude_code.py to look for prompts in the Docker image's /app/prompts/
+    # directory rather than in the cloned repo's working directory.
+    # The target repo doesn't commit prompts/ — they are
+    # baked into the image. Without PROJECT_ROOT=/app, get_project_prompts_dir()
+    # looks in cwd (the cloned repo) and raises FileNotFoundError, causing the
+    # subprocess to exit immediately with code 0, triggering the agent-complete path.
+    env['PROJECT_ROOT'] = '/app'
+
+    # Start agent subprocess - capture stderr to detect early failures
     agent_process = subprocess.Popen(
         cmd,
         cwd=cwd,
-        env=env
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
     )
 
-    print(f"✅ Agent started in background (PID: {agent_process.pid})")
-    print(f"📝 Agent output will appear in CloudWatch logs")
+    logger.info(f"Agent started in background (PID: {agent_process.pid})")
 
-    # Wait for agent to complete (will run for hours)
-    agent_process.wait()
+    # Monitor subprocess output in a separate thread for logging
+    def _log_subprocess_output():
+        """Read subprocess stdout/stderr and log via Python logging (OTEL-visible)."""
+        try:
+            for line in iter(agent_process.stdout.readline, b''):
+                text = line.decode('utf-8', errors='replace').rstrip()
+                if text:
+                    logger.info(f"[agent] {text}")
+        except Exception as e:
+            logger.error(f"Error reading agent output: {e}")
 
-    print(f"🏁 Agent completed with exit code: {agent_process.returncode}")
+    output_thread = threading.Thread(target=_log_subprocess_output, daemon=True)
+    output_thread.start()
+
+    # Poll for commits and push periodically while agent runs
+    # The handler's async generator monitoring loop may not execute if the
+    # AgentCore framework stops consuming it, so we push from this thread too.
+    push_interval = int(os.environ.get("PUSH_INTERVAL_SECONDS", "300"))
+    github_repo = os.environ.get("GITHUB_REPO_FOR_PUSH", "")
+    last_push = time.time()
+
+    while agent_process.poll() is None:
+        time.sleep(30)
+
+        # Periodic push
+        if build_dir and github_repo and (time.time() - last_push) >= push_interval:
+            try:
+                token_path = Path(GITHUB_TOKEN_FILE)
+                if token_path.exists():
+                    token = token_path.read_text().strip()
+                    push_url = f"https://x-access-token:{token}@github.com/{github_repo}.git"
+                    subprocess.run(
+                        ["git", "remote", "set-url", "origin", push_url],
+                        cwd=str(build_dir), capture_output=True, timeout=10
+                    )
+                    result = subprocess.run(
+                        ["git", "push", "-u", "origin", AGENT_BRANCH],
+                        cwd=str(build_dir), capture_output=True, timeout=60
+                    )
+                    if result.returncode == 0:
+                        logger.info("[background-push] Push successful")
+                    else:
+                        stderr = result.stderr.decode()[:200] if result.stderr else ""
+                        # "Everything up-to-date" is not an error
+                        if "up-to-date" not in stderr:
+                            logger.warning(f"[background-push] Push failed: {stderr}")
+                        else:
+                            logger.info("[background-push] Everything up-to-date")
+                else:
+                    logger.warning(f"[background-push] No token file at {GITHUB_TOKEN_FILE}")
+            except Exception as e:
+                logger.error(f"[background-push] Error: {e}")
+            last_push = time.time()
+
+    logger.info(f"Agent completed with exit code: {agent_process.returncode}")
+
+    # Log any remaining output
+    remaining_output = agent_process.stdout.read().decode('utf-8', errors='replace').strip()
+    if remaining_output:
+        for line in remaining_output.split('\n')[-20:]:  # Last 20 lines
+            logger.info(f"[agent-final] {line}")
 
 
 @app.entrypoint
@@ -1766,21 +1876,20 @@ async def handler(payload: Dict[str, Any], context: Any) -> Iterator[Dict[str, A
     """
     global session_start_time, agent_process, announced_commits, uploaded_screenshots, session_pushed_commits
 
-    print("\n" + "="*80)
-    print("🚀 Bedrock AgentCore Handler Invoked")
-    print("="*80)
-    print(f"Payload: {payload}")
-    print(f"Session ID: {context.session_id}")
-    print("="*80 + "\n")
+    logger.info("=" * 80)
+    logger.info("Bedrock AgentCore Handler Invoked")
+    logger.info(f"Payload: {json.dumps(payload, default=str)[:500]}")
+    logger.info(f"Session ID: {context.session_id}")
+    logger.info("=" * 80)
 
     # Propagate session ID to OpenTelemetry for trace correlation
     if OTEL_AVAILABLE and context.session_id:
         try:
             ctx = baggage.set_baggage("session.id", context.session_id)
             attach(ctx)
-            print(f"✅ Session ID propagated to OpenTelemetry: {context.session_id}")
+            logger.info(f"Session ID propagated to OpenTelemetry: {context.session_id}")
         except Exception as e:
-            print(f"⚠️ Failed to propagate session ID to OpenTelemetry: {e}")
+            logger.warning(f"Failed to propagate session ID to OpenTelemetry: {e}")
 
     # Initialize session start time
     if session_start_time is None:
@@ -1958,10 +2067,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
             }
 
             # Post session info to GitHub issue for tracking
-            agent_runtime_arn = os.environ.get(
-                "AGENT_RUNTIME_ARN",
-                "arn:aws:bedrock-agentcore:us-west-2:128673662201:runtime/antodo_agent-0UyfaL5NVq"
-            )
+            agent_runtime_arn = _resolve_agent_runtime_arn()
 
             # If resuming, post a resume notification instead of new session info
             if resume_session and restart_count > 0:
@@ -2035,7 +2141,29 @@ Progress will continue from where the previous session left off.""")
     task_id = app.add_async_task(f"building_{project}")
     print(f"📋 Registered async task: {task_id}")
 
+    # Clear any stale agent_state.json from EFS before starting a fresh session.
+    # EFS persists across container restarts and git operations do not remove
+    # untracked files. If a prior session wrote desired_state="pause" to signal
+    # completion, the new session would read that file and immediately mark the
+    # issue complete (within ~7 seconds) without doing any work.
+    # We DELETE the file (instead of updating it) because _set_agent_desired_state
+    # is a no-op when the file does not exist. Deleting guarantees claude_code.py
+    # will create a fresh file with desired_state="continuous" on startup.
+    if not resume_session:
+        for stale_path in [
+            AGENT_RUNTIME_DIR / "generated-app" / "agent_state.json",
+            AGENT_RUNTIME_DIR / "agent_state.json",
+        ]:
+            if stale_path.exists():
+                stale_path.unlink()
+                print(f"🧹 Removed stale agent_state.json at {stale_path}")
+            else:
+                print(f"✅ No stale agent_state.json at {stale_path} (already clean)")
+
     # Start agent in background thread
+    # Pass github_repo via env var so the background push loop can use it
+    if github_repo:
+        os.environ["GITHUB_REPO_FOR_PUSH"] = github_repo
     if agent_process is None or agent_process.poll() is not None:
         thread = threading.Thread(
             target=run_agent_background,
@@ -2277,10 +2405,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
                         store_session_state_ssm(issue_number, session_id=context.session_id)
 
                         # Post session info to the new issue
-                        agent_runtime_arn = os.environ.get(
-                            "AGENT_RUNTIME_ARN",
-                            "arn:aws:bedrock-agentcore:us-west-2:128673662201:runtime/antodo_agent-0UyfaL5NVq"
-                        )
+                        agent_runtime_arn = _resolve_agent_runtime_arn()
                         post_session_info_to_issue(
                             github_repo=github_repo,
                             issue_number=issue_number,
@@ -2383,12 +2508,12 @@ Commits should reference this issue: `Ref: #{issue_number}`
                 print(f"{'='*80}\n")
 
                 try:
-                    os.system("git config user.name 'Claude Code Agent'")
-                    os.system("git config user.email 'agent@anthropic.com'")
+                    subprocess.run(["git", "config", "user.name", "Claude Code Agent"], check=False)
+                    subprocess.run(["git", "config", "user.email", "agent@anthropic.com"], check=False)
 
                     gh_token = get_github_token(github_repo)
-                    os.system(f"git remote add origin https://x-access-token:{gh_token}@github.com/{github_repo}.git || true")
-                    push_result = os.system(f"git push -u origin {target_branch}")
+                    subprocess.run(["git", "remote", "add", "origin", f"https://x-access-token:{gh_token}@github.com/{github_repo}.git"], check=False)
+                    push_result = subprocess.run(["git", "push", "-u", "origin", target_branch]).returncode
 
                     if push_result == 0:
                         yield {
@@ -2493,10 +2618,7 @@ Commits should reference this issue: `Ref: #{issue_number}`
                         store_session_state_ssm(issue_number, session_id=context.session_id)
 
                         # Post session info to the new issue
-                        agent_runtime_arn = os.environ.get(
-                            "AGENT_RUNTIME_ARN",
-                            "arn:aws:bedrock-agentcore:us-west-2:128673662201:runtime/antodo_agent-0UyfaL5NVq"
-                        )
+                        agent_runtime_arn = _resolve_agent_runtime_arn()
                         post_session_info_to_issue(
                             github_repo=github_repo,
                             issue_number=issue_number,
